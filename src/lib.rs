@@ -5,6 +5,7 @@
 
 pub mod commitment;
 pub mod ipa;
+pub mod multiproof;
 pub mod node;
 pub mod proof;
 pub mod storage;
