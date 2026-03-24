@@ -111,7 +111,6 @@ The Quint Connect integration replays spec-generated traces against the Rust imp
 
 ## What's Left
 
-- **Banderwagon mapping**: `commitment_to_field()` currently hashes the serialized point with Blake3. The proper construction uses the Banderwagon quotient group's canonical map (x-coordinate extraction), which is faster and aligns with the Ethereum verkle spec. Small, self-contained change.
 - **Security audit**: Fiat-Shamir domain separation (are transcript labels collision-resistant across proof contexts?), CRS generation (deterministic RNG seed is not a proper trusted setup), and proof soundness (does the IPA folding match the Bulletproofs security proof?).
 
-Storage backends and any tier frameworks are application-level concerns handled by the consumer.
+- **Application-level concerns**: Storage backends and tier frameworks are application-level concerns handled by the consumer.

@@ -157,21 +157,25 @@ pub fn int_to_field(v: u64) -> FieldElement {
     FieldElement(Fr::from(v))
 }
 
-/// Convert a commitment (curve point) to a field element.
+/// Convert a commitment (curve point) to a field element using the
+/// Banderwagon mapping: `(x, y) → x / y`.
 ///
-/// Maps via hashing the serialized point. In production, this would use
-/// the Banderwagon "map to scalar" function.
+/// This is a canonical 2-to-1 map from the twisted Edwards curve to the
+/// base field, which identifies `(x, y)` and `(-x, -y)`. The result is
+/// serialized and interpreted as a scalar field element.
+///
+/// Follows the reference implementation in crate-crypto/rust-verkle.
 pub fn commitment_to_field(c: Commitment) -> FieldElement {
     use ark_serialize::CanonicalSerialize;
 
-    let mut bytes = Vec::new();
-    c.0.serialize_compressed(&mut bytes)
-        .expect("serialization should not fail");
-    let hash = blake3::hash(&bytes);
-    let mut scalar_bytes = [0u8; 32];
-    scalar_bytes[..31].copy_from_slice(&hash.as_bytes()[..31]);
-    scalar_bytes[31] = 0;
-    FieldElement(Fr::from_le_bytes_mod_order(&scalar_bytes))
+    // Banderwagon map: x / y
+    let x_div_y = c.0.x / c.0.y;
+
+    let mut bytes = [0u8; 32];
+    x_div_y
+        .serialize_compressed(&mut bytes[..])
+        .expect("could not serialize base field element");
+    FieldElement(Fr::from_le_bytes_mod_order(&bytes))
 }
 
 #[cfg(test)]

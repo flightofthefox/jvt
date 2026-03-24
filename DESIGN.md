@@ -616,7 +616,7 @@ Pedersen vector commitments on the Bandersnatch curve (defined over the BLS12-38
 
 **Value encoding:** Values ≤ 31 bytes are packed directly as field elements. Longer values are hashed with Blake3 and truncated to 31 bytes.
 
-**Commitment-to-scalar mapping:** `commitment_to_field(C)` hashes the compressed point representation with Blake3, producing a scalar. This is used when child commitments appear as values in parent vector commitments. A production implementation should use the Banderwagon "map to scalar" function instead.
+**Commitment-to-scalar mapping:** `commitment_to_field(C)` uses the Banderwagon mapping `x / y` — the x-coordinate divided by the y-coordinate of the affine point. This is a canonical 2-to-1 map that identifies `(x, y)` and `(-x, -y)`, producing a unique scalar for each group element without hashing. Follows the reference implementation in crate-crypto/rust-verkle.
 
 **Fiat-Shamir transcripts:** All non-interactive proofs use Blake3-based transcripts with an append-then-hash-then-clear pattern, following the protocol structure from crate-crypto/go-ipa.
 
