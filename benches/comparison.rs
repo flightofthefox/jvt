@@ -63,6 +63,31 @@ fn bench_insert_throughput(c: &mut Criterion) {
         });
     }
 
+    // Batch insert: single apply_updates call with many keys into an existing tree
+    for &batch_n in &[10, 100] {
+        let store = build_store(1000);
+        let updates: BTreeMap<Key, Option<Vec<u8>>> = (0..batch_n)
+            .map(|i| (make_key(10_000 + i), Some(vec![(i & 0xFF) as u8; 32])))
+            .collect();
+        group.bench_with_input(
+            BenchmarkId::new("batch_into_existing", batch_n),
+            &batch_n,
+            |b, _| {
+                b.iter_batched(
+                    || store.clone(),
+                    |mut s| {
+                        let parent = s.latest_version();
+                        let new_version = parent.map_or(1, |v| v + 1);
+                        let result = apply_updates(&s, parent, new_version, updates.clone());
+                        s.apply(&result);
+                        black_box(());
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
     group.finish();
 }
 

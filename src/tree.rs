@@ -5,7 +5,6 @@
 //! applies writes to storage.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
 use crate::commitment::*;
 use crate::node::*;
@@ -47,97 +46,56 @@ pub fn apply_updates<S: TreeReader>(
         "all keys must be at least 2 bytes (stem + suffix)"
     );
 
-    let mut overlay = OverlayStore::new(store);
-    // Resolve the parent root — only set current_root_key if the node actually exists
-    let mut current_root_key: Option<NodeKey> = parent_version
+    let current_root_key: Option<NodeKey> = parent_version
         .and_then(|v| store.get_root_key(v))
         .filter(|rk| store.get_node(rk).is_some());
+
     let mut batch = TreeUpdateBatch::default();
+    let updates_ref: Vec<(&Key, &Option<Value>)> = updates.iter().collect();
 
-    for (key, value) in updates {
-        let result = match value {
-            Some(v) => {
-                if let Some(ref root_key) = current_root_key {
-                    MutationResult::Updated(insert_single(
-                        &overlay,
-                        root_key,
-                        &key,
-                        v,
-                        0,
-                        new_version,
-                    ))
-                } else {
-                    // First insert into empty tree
-                    let stem = key[..key_stem_end(&key)].to_vec();
-                    let suffix = key_suffix(&key);
-                    let eas = EaSNode::new_single(stem, suffix, v);
-                    let commitment = eas.commitment();
-                    let root_key = NodeKey::root(new_version);
-                    let mut b = TreeUpdateBatch::default();
-                    b.put_node(root_key.clone(), Node::EaS(Box::new(eas)));
-                    MutationResult::Updated(InsertResult {
-                        new_node_key: root_key,
-                        new_commitment: commitment,
-                        batch: b,
-                    })
-                }
-            }
-            None => {
-                if let Some(ref root_key) = current_root_key {
-                    delete_single(&overlay, root_key, &key, 0, new_version)
-                } else {
-                    MutationResult::Unchanged // delete from empty tree = no-op
-                }
-            }
-        };
-
-        let result = match result {
-            MutationResult::Updated(r) => r,
-            MutationResult::Unchanged => continue,
-            MutationResult::Removed(b) => {
-                // The entire tree was deleted (root EaS had only this key)
-                for (nk, node) in &b.new_nodes {
-                    overlay.put(nk.clone(), node.clone());
-                }
-                current_root_key = None;
-                batch.stale_nodes.extend(b.stale_nodes);
-                continue;
-            }
-        };
-
-        // Apply writes to overlay so subsequent inserts see them
-        for (nk, node) in &result.batch.new_nodes {
-            overlay.put(nk.clone(), node.clone());
+    let final_root = match current_root_key {
+        Some(ref root_key) => {
+            batch_apply_node(store, root_key, &updates_ref, 0, new_version, &mut batch)
         }
-        current_root_key = Some(result.new_node_key.clone());
-
-        batch.new_nodes.extend(result.batch.new_nodes);
-        batch.stale_nodes.extend(result.batch.stale_nodes);
-    }
-
-    match current_root_key {
-        Some(root_key) => {
-            let root_commitment = batch
-                .new_nodes
+        None => {
+            // Empty tree — filter to inserts only and create from scratch
+            let inserts: Vec<(&Key, &Value)> = updates_ref
                 .iter()
-                .rev()
-                .find(|(nk, _)| *nk == root_key)
-                .map(|(_, node)| node.commitment())
+                .filter_map(|&(k, v)| v.as_ref().map(|val| (k, val)))
+                .collect();
+            if inserts.is_empty() {
+                BatchResult::Removed
+            } else {
+                let r = batch_create_subtree(&inserts, 0, &[], new_version, &mut batch);
+                BatchResult::Changed(r)
+            }
+        }
+    };
+
+    match final_root {
+        BatchResult::Changed(r) => {
+            batch.root_key = Some((new_version, r.node_key.clone()));
+            UpdateResult {
+                root_commitment: r.commitment,
+                root_key: r.node_key,
+                batch,
+            }
+        }
+        BatchResult::Unchanged => {
+            // Nothing changed — preserve existing root
+            let root_key = current_root_key.unwrap_or_else(|| NodeKey::root(new_version));
+            let root_commitment = store
+                .get_node(&root_key)
+                .map(|n| n.commitment())
                 .unwrap_or_else(zero_commitment);
-
             batch.root_key = Some((new_version, root_key.clone()));
-
             UpdateResult {
                 root_commitment,
                 root_key,
                 batch,
             }
         }
-        None => {
-            // Tree is empty (all keys deleted or no inserts).
-            // Store a root key that points to nothing — get_value returns None
-            // for any key, and the next apply_updates with this version as parent
-            // will correctly start a fresh tree.
+        BatchResult::Removed => {
             let root_key = NodeKey::root(new_version);
             batch.root_key = Some((new_version, root_key.clone()));
             UpdateResult {
@@ -169,42 +127,6 @@ pub fn root_commitment_at<S: TreeReader>(store: &S, version: u64) -> Commitment 
             None => zero_commitment(),
         },
         None => zero_commitment(),
-    }
-}
-
-// ============================================================
-// Internal: overlay store for batch updates
-// ============================================================
-
-/// A read-through overlay that layers uncommitted nodes on top of a base store.
-struct OverlayStore<'a, S> {
-    base: &'a S,
-    overlay: HashMap<NodeKey, Arc<Node>>,
-}
-
-impl<'a, S: TreeReader> OverlayStore<'a, S> {
-    fn new(base: &'a S) -> Self {
-        Self {
-            base,
-            overlay: HashMap::new(),
-        }
-    }
-
-    fn put(&mut self, key: NodeKey, node: Node) {
-        self.overlay.insert(key, Arc::new(node));
-    }
-}
-
-impl<S: TreeReader> TreeReader for OverlayStore<'_, S> {
-    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
-        self.overlay
-            .get(key)
-            .cloned()
-            .or_else(|| self.base.get_node(key))
-    }
-
-    fn get_root_key(&self, version: u64) -> Option<NodeKey> {
-        self.base.get_root_key(version)
     }
 }
 
@@ -265,418 +187,345 @@ fn verify_node_commitment<S: TreeReader>(store: &S, node_key: &NodeKey) -> bool 
 }
 
 // ============================================================
-// Internal: single-key insert
+// Internal: batch tree walk (handles inserts and deletes)
 // ============================================================
 
-struct InsertResult {
-    new_node_key: NodeKey,
-    new_commitment: Commitment,
-    batch: TreeUpdateBatch,
+struct BatchNodeResult {
+    node_key: NodeKey,
+    commitment: Commitment,
 }
 
-/// Result of a mutation (insert or delete).
-enum MutationResult {
-    /// Node was updated — new node replaces the old one.
-    Updated(InsertResult),
-    /// Node was removed entirely (delete emptied the last value).
-    /// Contains only stale node entries.
-    Removed(TreeUpdateBatch),
-    /// Nothing changed (e.g., deleting a non-existent key).
+enum BatchResult {
+    Changed(BatchNodeResult),
+    Removed,
     Unchanged,
 }
 
-fn insert_single<S: TreeReader>(
+/// Apply a batch of updates (inserts + deletes) to an existing subtree.
+fn batch_apply_node<S: TreeReader>(
     store: &S,
-    current_key: &NodeKey,
-    key: &Key,
-    value: Value,
+    node_key: &NodeKey,
+    updates: &[(&Key, &Option<Value>)],
     depth: usize,
     version: u64,
-) -> InsertResult {
-    let current_node = store.get_node(current_key).unwrap_or_else(|| {
-        panic!(
-            "node not found for key {:?} at depth {}",
-            current_key, depth
-        );
+    batch: &mut TreeUpdateBatch,
+) -> BatchResult {
+    if updates.is_empty() {
+        return BatchResult::Unchanged;
+    }
+
+    let current_node = store.get_node(node_key).unwrap_or_else(|| {
+        panic!("node not found for key {:?} at depth {}", node_key, depth);
     });
 
     match &*current_node {
-        Node::EaS(eas) => {
-            let expected_stem = &key[depth..key_stem_end(key)];
-            if eas.stem == expected_stem {
-                insert_update_eas(current_key, *eas.clone(), key, value, depth, version)
-            } else {
-                insert_split_eas(current_key, *eas.clone(), key, value, depth, version)
-            }
-        }
         Node::Internal(internal) => {
-            let child_index = key[depth];
-            if internal.children.contains_key(&child_index) {
-                insert_into_internal_existing(
-                    store,
-                    current_key,
-                    internal.clone(),
-                    key,
-                    value,
-                    depth,
-                    version,
-                )
-            } else {
-                insert_into_internal_empty(
-                    current_key,
-                    internal.clone(),
-                    key,
-                    value,
-                    depth,
-                    version,
-                )
+            batch_apply_internal(store, node_key, internal, updates, depth, version, batch)
+        }
+        Node::EaS(eas) => batch_apply_eas(node_key, eas, updates, depth, version, batch),
+    }
+}
+
+/// Batch apply updates to an internal node.
+fn batch_apply_internal<S: TreeReader>(
+    store: &S,
+    node_key: &NodeKey,
+    internal: &InternalNode,
+    updates: &[(&Key, &Option<Value>)],
+    depth: usize,
+    version: u64,
+    batch: &mut TreeUpdateBatch,
+) -> BatchResult {
+    let mut new_internal = internal.clone();
+    let path = &node_key.byte_path;
+    let mut changed = false;
+
+    let mut i = 0;
+    while i < updates.len() {
+        let child_byte = updates[i].0[depth];
+        let mut j = i + 1;
+        while j < updates.len() && updates[j].0[depth] == child_byte {
+            j += 1;
+        }
+        let group = &updates[i..j];
+        i = j;
+
+        let child_path: Vec<u8> = path
+            .iter()
+            .chain(std::iter::once(&child_byte))
+            .copied()
+            .collect();
+
+        if let Some(child) = internal.children.get(&child_byte) {
+            let child_key = NodeKey::new(child.version, child_path);
+            match batch_apply_node(store, &child_key, group, depth + 1, version, batch) {
+                BatchResult::Changed(r) => {
+                    new_internal.update_child(child_byte, Child::new(version, r.commitment));
+                    changed = true;
+                }
+                BatchResult::Removed => {
+                    new_internal.children.remove(&child_byte);
+                    new_internal.commitment =
+                        InternalNode::compute_commitment(&new_internal.children);
+                    changed = true;
+                }
+                BatchResult::Unchanged => {}
+            }
+        } else {
+            // No existing child — filter to inserts only
+            let inserts: Vec<(&Key, &Value)> = group
+                .iter()
+                .filter_map(|&(k, v)| v.as_ref().map(|val| (k, val)))
+                .collect();
+            if !inserts.is_empty() {
+                let r = batch_create_subtree(&inserts, depth + 1, &child_path, version, batch);
+                new_internal.update_child(child_byte, Child::new(version, r.commitment));
+                changed = true;
             }
         }
     }
-}
 
-fn insert_update_eas(
-    old_key: &NodeKey,
-    mut eas: EaSNode,
-    key: &Key,
-    value: Value,
-    depth: usize,
-    version: u64,
-) -> InsertResult {
-    let suffix = key_suffix(key);
-    eas.update_value(suffix, value);
-
-    let new_key = NodeKey::new(version, key[..depth].to_vec());
-    let commitment = eas.commitment();
-
-    let mut batch = TreeUpdateBatch::default();
-    batch.put_node(new_key.clone(), Node::EaS(Box::new(eas)));
-    batch.mark_stale(old_key.clone(), version);
-
-    InsertResult {
-        new_node_key: new_key,
-        new_commitment: commitment,
-        batch,
+    if !changed {
+        return BatchResult::Unchanged;
     }
+
+    if new_internal.children.is_empty() {
+        batch.mark_stale(node_key.clone(), version);
+        return BatchResult::Removed;
+    }
+
+    // Collapse: single EaS child remaining → merge into one EaS with longer stem
+    if new_internal.children.len() == 1 {
+        let (&remaining_idx, remaining_child) = new_internal.children.iter().next().unwrap();
+        let remaining_path: Vec<u8> = path
+            .iter()
+            .chain(std::iter::once(&remaining_idx))
+            .copied()
+            .collect();
+        let remaining_key = NodeKey::new(remaining_child.version, remaining_path.clone());
+
+        // Check batch first (child may have been created/modified in this batch),
+        // then fall back to store
+        let remaining_node = batch
+            .new_nodes
+            .iter()
+            .rev()
+            .find(|(nk, _)| *nk == remaining_key)
+            .map(|(_, n)| n)
+            .cloned()
+            .or_else(|| store.get_node(&remaining_key).map(|arc| (*arc).clone()));
+
+        if let Some(Node::EaS(remaining_eas)) = remaining_node.as_ref() {
+            let mut new_stem = vec![remaining_idx];
+            new_stem.extend_from_slice(&remaining_eas.stem);
+            let collapsed = EaSNode::from_values(new_stem, remaining_eas.values.clone());
+            let collapsed_key = NodeKey::new(version, path.clone());
+            let commitment = collapsed.commitment();
+            batch.put_node(collapsed_key.clone(), Node::EaS(Box::new(collapsed)));
+            batch.mark_stale(node_key.clone(), version);
+            batch.mark_stale(remaining_key, version);
+            return BatchResult::Changed(BatchNodeResult {
+                node_key: collapsed_key,
+                commitment,
+            });
+        }
+    }
+
+    let new_key = NodeKey::new(version, path.clone());
+    let commitment = new_internal.commitment;
+    batch.put_node(new_key.clone(), Node::Internal(new_internal));
+    batch.mark_stale(node_key.clone(), version);
+
+    BatchResult::Changed(BatchNodeResult {
+        node_key: new_key,
+        commitment,
+    })
 }
 
-fn insert_split_eas(
-    old_key: &NodeKey,
-    existing_eas: EaSNode,
-    key: &Key,
-    value: Value,
+/// Batch apply updates to an EaS node.
+fn batch_apply_eas(
+    node_key: &NodeKey,
+    eas: &EaSNode,
+    updates: &[(&Key, &Option<Value>)],
     depth: usize,
     version: u64,
-) -> InsertResult {
-    let existing_stem = &existing_eas.stem;
-    let new_stem = &key[depth..key_stem_end(key)];
+    batch: &mut TreeUpdateBatch,
+) -> BatchResult {
+    let path = &node_key.byte_path;
 
-    let prefix_len = common_prefix_len(existing_stem, new_stem);
+    // Partition updates by whether they match the existing stem
+    let mut same_stem_inserts: Vec<(u8, &Value)> = Vec::new();
+    let mut same_stem_deletes: Vec<u8> = Vec::new();
+    let mut divergent_inserts: Vec<(&Key, &Value)> = Vec::new();
 
-    let existing_byte = existing_stem[prefix_len];
-    let new_byte = new_stem[prefix_len];
+    for &(key, value) in updates {
+        let expected_stem = &key[depth..key_stem_end(key)];
+        if eas.stem == expected_stem {
+            match value {
+                Some(v) => same_stem_inserts.push((key_suffix(key), v)),
+                None => same_stem_deletes.push(key_suffix(key)),
+            }
+        } else if let Some(v) = value {
+            divergent_inserts.push((key, v));
+        }
+        // Divergent deletes are no-ops (key doesn't exist)
+    }
 
-    let existing_new_stem = existing_stem[prefix_len + 1..].to_vec();
-    let existing_new_eas = EaSNode::from_values(existing_new_stem, existing_eas.values.clone());
+    if divergent_inserts.is_empty() {
+        // All updates target the existing stem
+        if same_stem_inserts.is_empty() && same_stem_deletes.is_empty() {
+            return BatchResult::Unchanged;
+        }
 
-    let new_eas_stem = new_stem[prefix_len + 1..].to_vec();
-    let new_eas = EaSNode::new_single(new_eas_stem, key_suffix(key), value);
+        let mut new_values = eas.values.clone();
+        for suffix in &same_stem_deletes {
+            new_values.remove(suffix);
+        }
+        // Check: did deletes remove values that inserts will re-add?
+        // Apply inserts after deletes so inserts win
+        for &(suffix, value) in &same_stem_inserts {
+            new_values.insert(suffix, value.clone());
+        }
+
+        if new_values.is_empty() {
+            batch.mark_stale(node_key.clone(), version);
+            return BatchResult::Removed;
+        }
+
+        // Use homomorphic updates for pure inserts/updates on existing EaS
+        if same_stem_deletes.is_empty() {
+            let mut new_eas = (*eas).clone();
+            for &(suffix, value) in &same_stem_inserts {
+                new_eas.update_value(suffix, value.clone());
+            }
+            let new_key = NodeKey::new(version, path.clone());
+            let commitment = new_eas.commitment();
+            batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));
+            batch.mark_stale(node_key.clone(), version);
+            return BatchResult::Changed(BatchNodeResult {
+                node_key: new_key,
+                commitment,
+            });
+        }
+
+        // Deletes present — recompute from scratch (simpler than tracking deltas)
+        let new_eas = EaSNode::from_values(eas.stem.clone(), new_values);
+        let new_key = NodeKey::new(version, path.clone());
+        let commitment = new_eas.commitment();
+        batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));
+        batch.mark_stale(node_key.clone(), version);
+        return BatchResult::Changed(BatchNodeResult {
+            node_key: new_key,
+            commitment,
+        });
+    }
+
+    // Divergent inserts exist — rebuild the subtree from scratch.
+    // Collect all surviving values (existing + inserts - deletes) as synthetic keys.
+    let mut all_keys_and_values: Vec<(Key, Value)> = Vec::new();
+
+    // Existing EaS values
+    let delete_set: std::collections::HashSet<u8> = same_stem_deletes.iter().copied().collect();
+    for (&suffix, value) in &eas.values {
+        if !delete_set.contains(&suffix) {
+            let mut full_key = path.to_vec();
+            full_key.extend_from_slice(&eas.stem);
+            full_key.push(suffix);
+            all_keys_and_values.push((full_key, value.clone()));
+        }
+    }
+    // Same-stem inserts (override any existing)
+    for &(suffix, value) in &same_stem_inserts {
+        let mut full_key = path.to_vec();
+        full_key.extend_from_slice(&eas.stem);
+        full_key.push(suffix);
+        all_keys_and_values.push((full_key, value.clone()));
+    }
+    // Divergent inserts
+    for &(key, value) in &divergent_inserts {
+        all_keys_and_values.push((key.clone(), value.clone()));
+    }
+
+    all_keys_and_values.sort_by(|a, b| a.0.cmp(&b.0));
+    all_keys_and_values.dedup_by(|a, b| {
+        if a.0 == b.0 {
+            std::mem::swap(&mut a.1, &mut b.1);
+            true
+        } else {
+            false
+        }
+    });
+
+    batch.mark_stale(node_key.clone(), version);
+
+    if all_keys_and_values.is_empty() {
+        return BatchResult::Removed;
+    }
+
+    let refs: Vec<(&Key, &Value)> = all_keys_and_values.iter().map(|(k, v)| (k, v)).collect();
+    let result = batch_create_subtree(&refs, depth, path, version, batch);
+    BatchResult::Changed(result)
+}
+
+/// Create a new subtree from scratch for a set of inserts.
+fn batch_create_subtree(
+    inserts: &[(&Key, &Value)],
+    depth: usize,
+    node_path: &[u8],
+    version: u64,
+    batch: &mut TreeUpdateBatch,
+) -> BatchNodeResult {
+    debug_assert!(!inserts.is_empty());
+
+    let first_stem = &inserts[0].0[depth..key_stem_end(inserts[0].0)];
+    let all_same_stem = inserts
+        .iter()
+        .all(|(k, _)| k[depth..key_stem_end(k)] == *first_stem);
+
+    if all_same_stem {
+        let stem = first_stem.to_vec();
+        let mut values = HashMap::new();
+        for (key, value) in inserts {
+            values.insert(key_suffix(key), (*value).clone());
+        }
+        let eas = EaSNode::from_values(stem, values);
+        let commitment = eas.commitment();
+        let node_key = NodeKey::new(version, node_path.to_vec());
+        batch.put_node(node_key.clone(), Node::EaS(Box::new(eas)));
+        return BatchNodeResult {
+            node_key,
+            commitment,
+        };
+    }
 
     let mut children = HashMap::new();
-    children.insert(
-        existing_byte,
-        Child::new(version, existing_new_eas.commitment()),
-    );
-    children.insert(new_byte, Child::new(version, new_eas.commitment()));
-    let diverge_node = InternalNode::new(children);
-    let diverge_commitment = diverge_node.commitment;
-
-    let mut batch = TreeUpdateBatch::default();
-    batch.mark_stale(old_key.clone(), version);
-
-    let base_path = &key[..depth];
-    let diverge_path: Vec<u8> = base_path
-        .iter()
-        .chain(key[depth..depth + prefix_len].iter())
-        .copied()
-        .collect();
-
-    let existing_eas_path: Vec<u8> = diverge_path
-        .iter()
-        .chain(std::iter::once(&existing_byte))
-        .copied()
-        .collect();
-    let new_eas_path: Vec<u8> = diverge_path
-        .iter()
-        .chain(std::iter::once(&new_byte))
-        .copied()
-        .collect();
-
-    batch.put_node(
-        NodeKey::new(version, existing_eas_path),
-        Node::EaS(Box::new(existing_new_eas)),
-    );
-    batch.put_node(
-        NodeKey::new(version, new_eas_path),
-        Node::EaS(Box::new(new_eas)),
-    );
-
-    if prefix_len == 0 {
-        let result_key = NodeKey::new(version, base_path.to_vec());
-        batch.put_node(result_key.clone(), Node::Internal(diverge_node));
-        InsertResult {
-            new_node_key: result_key,
-            new_commitment: diverge_commitment,
-            batch,
+    let mut i = 0;
+    while i < inserts.len() {
+        let child_byte = inserts[i].0[depth];
+        let mut j = i + 1;
+        while j < inserts.len() && inserts[j].0[depth] == child_byte {
+            j += 1;
         }
-    } else {
-        let diverge_key = NodeKey::new(version, diverge_path.clone());
-        batch.put_node(diverge_key, Node::Internal(diverge_node));
+        let group = &inserts[i..j];
+        i = j;
 
-        let mut child_commitment = diverge_commitment;
-        for i in (0..prefix_len).rev() {
-            let path: Vec<u8> = base_path
-                .iter()
-                .chain(key[depth..depth + i].iter())
-                .copied()
-                .collect();
-            let child_byte = key[depth + i];
-            let mut children = HashMap::new();
-            children.insert(child_byte, Child::new(version, child_commitment));
-            let intermediate = InternalNode::new(children);
-            child_commitment = intermediate.commitment;
-            batch.put_node(NodeKey::new(version, path), Node::Internal(intermediate));
-        }
-
-        let result_key = NodeKey::new(version, base_path.to_vec());
-        InsertResult {
-            new_node_key: result_key,
-            new_commitment: child_commitment,
-            batch,
-        }
+        let child_path: Vec<u8> = node_path
+            .iter()
+            .chain(std::iter::once(&child_byte))
+            .copied()
+            .collect();
+        let child_result = batch_create_subtree(group, depth + 1, &child_path, version, batch);
+        children.insert(child_byte, Child::new(version, child_result.commitment));
     }
-}
 
-fn insert_into_internal_existing<S: TreeReader>(
-    store: &S,
-    old_key: &NodeKey,
-    internal: InternalNode,
-    key: &Key,
-    value: Value,
-    depth: usize,
-    version: u64,
-) -> InsertResult {
-    let child_index = key[depth];
-    let child = &internal.children[&child_index];
-    let child_path: Vec<u8> = key[..depth + 1].to_vec();
-    let child_key = NodeKey::new(child.version, child_path);
+    let internal = InternalNode::new(children);
+    let commitment = internal.commitment;
+    let node_key = NodeKey::new(version, node_path.to_vec());
+    batch.put_node(node_key.clone(), Node::Internal(internal));
 
-    let child_result = insert_single(store, &child_key, key, value, depth + 1, version);
-
-    let mut new_internal = internal.clone();
-    new_internal.update_child(
-        child_index,
-        Child::new(version, child_result.new_commitment),
-    );
-
-    let new_key = NodeKey::new(version, key[..depth].to_vec());
-    let commitment = new_internal.commitment;
-
-    let mut batch = child_result.batch;
-    batch.put_node(new_key.clone(), Node::Internal(new_internal));
-    batch.mark_stale(old_key.clone(), version);
-
-    InsertResult {
-        new_node_key: new_key,
-        new_commitment: commitment,
-        batch,
-    }
-}
-
-fn insert_into_internal_empty(
-    old_key: &NodeKey,
-    internal: InternalNode,
-    key: &Key,
-    value: Value,
-    depth: usize,
-    version: u64,
-) -> InsertResult {
-    let child_index = key[depth];
-    let stem = key[depth + 1..key_stem_end(key)].to_vec();
-    let suffix = key_suffix(key);
-    let new_eas = EaSNode::new_single(stem, suffix, value);
-    let eas_commitment = new_eas.commitment();
-
-    let eas_path: Vec<u8> = key[..depth + 1].to_vec();
-    let eas_key = NodeKey::new(version, eas_path);
-
-    let mut new_internal = internal.clone();
-    new_internal.update_child(child_index, Child::new(version, eas_commitment));
-
-    let new_key = NodeKey::new(version, key[..depth].to_vec());
-    let commitment = new_internal.commitment;
-
-    let mut batch = TreeUpdateBatch::default();
-    batch.put_node(eas_key, Node::EaS(Box::new(new_eas)));
-    batch.put_node(new_key.clone(), Node::Internal(new_internal));
-    batch.mark_stale(old_key.clone(), version);
-
-    InsertResult {
-        new_node_key: new_key,
-        new_commitment: commitment,
-        batch,
-    }
-}
-
-// ============================================================
-// Internal: single-key delete
-// ============================================================
-
-fn delete_single<S: TreeReader>(
-    store: &S,
-    current_key: &NodeKey,
-    key: &Key,
-    depth: usize,
-    version: u64,
-) -> MutationResult {
-    let current_node = match store.get_node(current_key) {
-        Some(n) => n,
-        None => return MutationResult::Unchanged,
-    };
-
-    match &*current_node {
-        Node::EaS(eas) => {
-            let expected_stem = &key[depth..key_stem_end(key)];
-            if eas.stem != expected_stem {
-                return MutationResult::Unchanged; // wrong stem, key doesn't exist
-            }
-            let suffix = key_suffix(key);
-            if !eas.values.contains_key(&suffix) {
-                return MutationResult::Unchanged; // suffix slot empty, key doesn't exist
-            }
-
-            let mut values = eas.values.clone();
-            values.remove(&suffix);
-
-            if values.is_empty() {
-                // EaS is now empty — remove it entirely
-                let mut batch = TreeUpdateBatch::default();
-                batch.mark_stale(current_key.clone(), version);
-                MutationResult::Removed(batch)
-            } else {
-                // Recompute commitments with the value removed
-                let new_eas = EaSNode::from_values(eas.stem.clone(), values);
-                let new_key = NodeKey::new(version, key[..depth].to_vec());
-                let commitment = new_eas.commitment();
-                let mut batch = TreeUpdateBatch::default();
-                batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));
-                batch.mark_stale(current_key.clone(), version);
-                MutationResult::Updated(InsertResult {
-                    new_node_key: new_key,
-                    new_commitment: commitment,
-                    batch,
-                })
-            }
-        }
-        Node::Internal(internal) => {
-            let child_index = key[depth];
-            let child = match internal.children.get(&child_index) {
-                Some(c) => c,
-                None => return MutationResult::Unchanged, // empty slot, key doesn't exist
-            };
-
-            let child_path: Vec<u8> = key[..depth + 1].to_vec();
-            let child_key = NodeKey::new(child.version, child_path);
-
-            let child_result = delete_single(store, &child_key, key, depth + 1, version);
-
-            match child_result {
-                MutationResult::Unchanged => MutationResult::Unchanged,
-                MutationResult::Updated(child_update) => {
-                    let mut new_internal = internal.clone();
-                    new_internal.update_child(
-                        child_index,
-                        Child::new(version, child_update.new_commitment),
-                    );
-
-                    let new_key = NodeKey::new(version, key[..depth].to_vec());
-                    let commitment = new_internal.commitment;
-                    let mut batch = child_update.batch;
-                    batch.put_node(new_key.clone(), Node::Internal(new_internal));
-                    batch.mark_stale(current_key.clone(), version);
-                    MutationResult::Updated(InsertResult {
-                        new_node_key: new_key,
-                        new_commitment: commitment,
-                        batch,
-                    })
-                }
-                MutationResult::Removed(mut stale_batch) => {
-                    // Child was removed — remove it from this internal node
-                    stale_batch.mark_stale(current_key.clone(), version);
-
-                    let mut new_children = internal.children.clone();
-                    new_children.remove(&child_index);
-
-                    if new_children.is_empty() {
-                        // Internal node is now empty — remove it too
-                        MutationResult::Removed(stale_batch)
-                    } else if new_children.len() == 1 {
-                        // Single child remaining — try to collapse
-                        let (&remaining_idx, remaining_child) = new_children.iter().next().unwrap();
-                        let remaining_path: Vec<u8> = key[..depth]
-                            .iter()
-                            .chain(std::iter::once(&remaining_idx))
-                            .copied()
-                            .collect();
-                        let remaining_key = NodeKey::new(remaining_child.version, remaining_path);
-
-                        let remaining_node = store.get_node(&remaining_key);
-                        if let Some(Node::EaS(remaining_eas)) = remaining_node.as_deref() {
-                            // Collapse: merge the single-child internal + EaS into one EaS
-                            // with a longer stem (prepend the remaining_idx byte)
-                            let mut new_stem = vec![remaining_idx];
-                            new_stem.extend_from_slice(&remaining_eas.stem);
-                            let collapsed =
-                                EaSNode::from_values(new_stem, remaining_eas.values.clone());
-                            let collapsed_key = NodeKey::new(version, key[..depth].to_vec());
-                            let commitment = collapsed.commitment();
-                            stale_batch
-                                .put_node(collapsed_key.clone(), Node::EaS(Box::new(collapsed)));
-                            // The remaining child's old key is now stale too
-                            stale_batch.mark_stale(remaining_key, version);
-                            MutationResult::Updated(InsertResult {
-                                new_node_key: collapsed_key,
-                                new_commitment: commitment,
-                                batch: stale_batch,
-                            })
-                        } else {
-                            // Remaining child is an internal node — can't collapse,
-                            // just update this node with fewer children
-                            let new_internal = InternalNode::new(new_children);
-                            let new_key = NodeKey::new(version, key[..depth].to_vec());
-                            let commitment = new_internal.commitment;
-                            stale_batch.put_node(new_key.clone(), Node::Internal(new_internal));
-                            MutationResult::Updated(InsertResult {
-                                new_node_key: new_key,
-                                new_commitment: commitment,
-                                batch: stale_batch,
-                            })
-                        }
-                    } else {
-                        // Multiple children remain — just update the internal node
-                        let new_internal = InternalNode::new(new_children);
-                        let new_key = NodeKey::new(version, key[..depth].to_vec());
-                        let commitment = new_internal.commitment;
-                        stale_batch.put_node(new_key.clone(), Node::Internal(new_internal));
-                        MutationResult::Updated(InsertResult {
-                            new_node_key: new_key,
-                            new_commitment: commitment,
-                            batch: stale_batch,
-                        })
-                    }
-                }
-            }
-        }
+    BatchNodeResult {
+        node_key,
+        commitment,
     }
 }
 
