@@ -395,9 +395,11 @@ fn batch_apply_eas(
         // Use homomorphic updates for pure inserts/updates on existing EaS
         if same_stem_deletes.is_empty() {
             let mut new_eas = (*eas).clone();
-            for &(suffix, value) in &same_stem_inserts {
-                new_eas.update_value(suffix, value.clone());
-            }
+            new_eas.batch_update_values(
+                same_stem_inserts
+                    .iter()
+                    .map(|&(suffix, value)| (suffix, value.clone())),
+            );
             let new_key = NodeKey::new(version, path.clone());
             let commitment = new_eas.commitment();
             batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));

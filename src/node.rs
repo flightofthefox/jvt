@@ -262,16 +262,38 @@ impl EaSNode {
 
     /// Update a single value slot, recomputing commitments.
     pub fn update_value(&mut self, suffix: u8, new_value: Value) {
-        let old_field = self
-            .values
-            .get(&suffix)
-            .map(|v| value_to_field(v))
-            .unwrap_or(field_zero());
-        let new_field = value_to_field(&new_value);
+        self.batch_update_values(std::iter::once((suffix, new_value)));
+    }
 
-        if suffix < 128 {
-            let old_c1_field = self.c1_field;
-            self.c1 = commit_update(self.c1, suffix as usize, old_field, new_field);
+    /// Update multiple value slots, deferring expensive commitment_to_field
+    /// and extension_commitment updates until all sub-commitment updates are done.
+    pub fn batch_update_values(&mut self, updates: impl IntoIterator<Item = (u8, Value)>) {
+        let mut c1_changed = false;
+        let mut c2_changed = false;
+        let old_c1_field = self.c1_field;
+        let old_c2_field = self.c2_field;
+
+        for (suffix, new_value) in updates {
+            let old_field = self
+                .values
+                .get(&suffix)
+                .map(|v| value_to_field(v))
+                .unwrap_or(field_zero());
+            let new_field = value_to_field(&new_value);
+
+            if suffix < 128 {
+                self.c1 = commit_update(self.c1, suffix as usize, old_field, new_field);
+                c1_changed = true;
+            } else {
+                self.c2 = commit_update(self.c2, (suffix - 128) as usize, old_field, new_field);
+                c2_changed = true;
+            }
+
+            self.values.insert(suffix, new_value);
+        }
+
+        // Only compute commitment_to_field and update extension once per half
+        if c1_changed {
             self.c1_field = commitment_to_field(self.c1);
             self.extension_commitment = commit_update(
                 self.extension_commitment,
@@ -279,9 +301,8 @@ impl EaSNode {
                 old_c1_field,
                 self.c1_field,
             );
-        } else {
-            let old_c2_field = self.c2_field;
-            self.c2 = commit_update(self.c2, (suffix - 128) as usize, old_field, new_field);
+        }
+        if c2_changed {
             self.c2_field = commitment_to_field(self.c2);
             self.extension_commitment = commit_update(
                 self.extension_commitment,
@@ -290,8 +311,6 @@ impl EaSNode {
                 self.c2_field,
             );
         }
-
-        self.values.insert(suffix, new_value);
     }
 
     /// Get the overall commitment for this node (used as value in parent commitments).
