@@ -270,11 +270,21 @@ impl EaSNode {
     ///
     /// `Some(value)` upserts, `None` deletes. Homomorphic in both cases:
     /// delete is `commit_update(c, idx, old_field, field_zero())`.
+    ///
+    /// Accumulates c1/c2 deltas in projective to avoid per-update affine
+    /// conversions (field inversions), converting to affine once at the end.
     pub fn batch_update_values(&mut self, updates: impl IntoIterator<Item = (u8, Option<Value>)>) {
+        use ark_ec::CurveGroup;
+        use ark_ed_on_bls12_381_bandersnatch::EdwardsProjective;
+
+        let basis = get_basis();
         let mut c1_changed = false;
         let mut c2_changed = false;
         let old_c1_field = self.c1_field;
         let old_c2_field = self.c2_field;
+
+        let mut c1_proj: EdwardsProjective = self.c1.0.into();
+        let mut c2_proj: EdwardsProjective = self.c2.0.into();
 
         for (suffix, new_value) in updates {
             let old_field = self
@@ -287,11 +297,12 @@ impl EaSNode {
                 .map(|v| value_to_field(v))
                 .unwrap_or(field_zero());
 
+            let delta = new_field.0 - old_field.0;
             if suffix < 128 {
-                self.c1 = commit_update(self.c1, suffix as usize, old_field, new_field);
+                c1_proj += basis[suffix as usize] * delta;
                 c1_changed = true;
             } else {
-                self.c2 = commit_update(self.c2, (suffix - 128) as usize, old_field, new_field);
+                c2_proj += basis[(suffix - 128) as usize] * delta;
                 c2_changed = true;
             }
 
@@ -301,8 +312,9 @@ impl EaSNode {
             };
         }
 
-        // Only compute commitment_to_field and update extension once per half
+        // Convert to affine once, then update extension commitment
         if c1_changed {
+            self.c1 = Commitment(c1_proj.into_affine());
             self.c1_field = commitment_to_field(self.c1);
             self.extension_commitment = commit_update(
                 self.extension_commitment,
@@ -312,6 +324,7 @@ impl EaSNode {
             );
         }
         if c2_changed {
+            self.c2 = Commitment(c2_proj.into_affine());
             self.c2_field = commitment_to_field(self.c2);
             self.extension_commitment = commit_update(
                 self.extension_commitment,
