@@ -1,17 +1,15 @@
-//! Verkle proof generation and verification using real IPA opening proofs.
+//! Verkle proof generation and verification.
 //!
-//! Two proof modes:
-//! - Individual proofs: one IPA per tree level per key (~544 bytes/level)
-//! - Aggregated multiproof: ALL openings across ALL keys compressed into
-//!   a single 576-byte proof via the Dankrad Feist multipoint scheme.
-//!
+//! All proofs use the Dankrad Feist multipoint scheme, producing a constant
+//! 576-byte proof regardless of how many keys are included. Even single-key
+//! proofs go through the multipoint system — there's no separate code path.
+
 use std::collections::HashMap;
 
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_ff::AdditiveGroup;
 
 use crate::commitment::{commitment_to_field, Commitment};
-use crate::ipa::{self as old_ipa, IpaProof};
 use crate::multiproof::crs::shared_crs;
 use crate::multiproof::lagrange::{LagrangeBasis, PrecomputedWeights};
 use crate::multiproof::prover::{MultiPointProof, MultiPointProver, ProverQuery, VerifierQuery};
@@ -25,42 +23,6 @@ use crate::storage::*;
 
 static PRECOMP: std::sync::LazyLock<PrecomputedWeights> =
     std::sync::LazyLock::new(|| PrecomputedWeights::new(256));
-
-// ============================================================
-// Individual proofs (per-level IPA, kept for single-key use)
-// ============================================================
-
-/// A single-level IPA opening proof with metadata.
-#[derive(Clone, Debug)]
-pub struct LevelProof {
-    pub commitment: Commitment,
-    pub index: u8,
-    pub claimed_value: Fr,
-    pub ipa_proof: IpaProof,
-}
-
-/// A complete verkle proof for a single key with real IPA opening proofs.
-#[derive(Clone, Debug)]
-pub struct RealVerkleProof {
-    pub level_proofs: Vec<LevelProof>,
-    pub eas_stem: Vec<u8>,
-    pub value: Option<Value>,
-    pub inclusion: bool,
-    pub depth: usize,
-}
-
-impl RealVerkleProof {
-    pub fn byte_size(&self) -> usize {
-        let level_bytes: usize = self
-            .level_proofs
-            .iter()
-            .map(|p| p.ipa_proof.byte_size())
-            .sum();
-        let stem_bytes = self.eas_stem.len();
-        let value_bytes = self.value.as_ref().map_or(0, |v| v.len());
-        level_bytes + stem_bytes + value_bytes + 8
-    }
-}
 
 // ============================================================
 // Helpers
@@ -77,7 +39,6 @@ fn internal_node_vector(internal: &InternalNode) -> Vec<Fr> {
 
 /// Data collected during tree traversal for one key.
 struct KeyTraversal {
-    /// (commitment_affine, value_vector, child_index, child_value_as_scalar)
     openings: Vec<(EdwardsAffine, Vec<Fr>, usize, Fr)>,
     eas_stem: Vec<u8>,
     value: Option<Value>,
@@ -155,81 +116,10 @@ fn traverse_for_key<S: TreeReader>(
 }
 
 // ============================================================
-// Individual proof generation (single key)
+// Proof types
 // ============================================================
 
-/// Generate a verkle proof with individual IPA proofs for a single key.
-pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<RealVerkleProof> {
-    let traversal = traverse_for_key(store, root_key, key)?;
-
-    let level_proofs: Vec<LevelProof> = traversal
-        .openings
-        .iter()
-        .map(|(comm, a, index, claimed)| {
-            let (_, ipa_proof) = old_ipa::prove(a, comm, *index);
-            LevelProof {
-                commitment: Commitment(*comm),
-                index: *index as u8,
-                claimed_value: *claimed,
-                ipa_proof,
-            }
-        })
-        .collect();
-
-    Some(RealVerkleProof {
-        level_proofs,
-        eas_stem: traversal.eas_stem,
-        value: traversal.value,
-        inclusion: traversal.inclusion,
-        depth: traversal.depth,
-    })
-}
-
-/// Verify a single-key verkle proof.
-pub fn verify(
-    proof: &RealVerkleProof,
-    root_commitment: Commitment,
-    key: &Key,
-    expected_value: Option<&Value>,
-) -> bool {
-    if proof.value.as_ref() != expected_value {
-        return false;
-    }
-    if proof.inclusion != expected_value.is_some() {
-        return false;
-    }
-
-    let expected_commitment = root_commitment;
-    for level_proof in &proof.level_proofs {
-        if level_proof.commitment != expected_commitment {
-            return false;
-        }
-        if !old_ipa::verify(
-            &level_proof.commitment.0,
-            level_proof.index as usize,
-            &level_proof.claimed_value,
-            &level_proof.ipa_proof,
-            256,
-        ) {
-            return false;
-        }
-    }
-
-    if proof.inclusion {
-        let expected_stem = &key[proof.depth..31];
-        if proof.eas_stem != expected_stem {
-            return false;
-        }
-    }
-
-    true
-}
-
-// ============================================================
-// Aggregated multiproof (batch keys → single 576-byte proof)
-// ============================================================
-
-/// Per-key metadata included in the aggregated proof.
+/// Per-key metadata included in the proof.
 #[derive(Clone, Debug)]
 pub struct KeyProofData {
     pub key: Key,
@@ -239,23 +129,22 @@ pub struct KeyProofData {
     pub depth: usize,
 }
 
-/// An aggregated verkle proof using the Dankrad Feist multipoint scheme.
+/// A verkle proof using the Dankrad Feist multipoint scheme.
 ///
 /// Contains a single `MultiPointProof` (~576 bytes) that covers ALL openings
-/// across ALL keys, plus the per-key metadata and verifier query data needed
+/// across ALL keys, plus per-key metadata and verifier query data needed
 /// to reconstruct the transcript during verification.
 #[derive(Clone, Debug)]
-pub struct AggregatedMultiProof {
+pub struct VerkleProof {
     /// The constant-size multipoint proof.
     pub multipoint_proof: MultiPointProof,
     /// Per-key proof data (stem, value, inclusion).
     pub key_data: Vec<KeyProofData>,
     /// Verifier query data: (commitment, point, result) for each opening.
-    /// Shared across keys that traverse the same nodes.
     pub verifier_queries: Vec<(EdwardsAffine, usize, Fr)>,
 }
 
-impl AggregatedMultiProof {
+impl VerkleProof {
     /// The multipoint proof size (constant regardless of key count).
     pub fn proof_byte_size(&self) -> usize {
         self.multipoint_proof.byte_size()
@@ -264,9 +153,7 @@ impl AggregatedMultiProof {
     /// Total proof size including all metadata.
     pub fn total_byte_size(&self) -> usize {
         let proof_bytes = self.multipoint_proof.byte_size();
-        // Per query: 32 (commitment) + 1 (point) + 32 (result) = 65
         let query_bytes = self.verifier_queries.len() * 65;
-        // Per key: 32 (key) + stem + value + flags
         let key_bytes: usize = self
             .key_data
             .iter()
@@ -276,25 +163,23 @@ impl AggregatedMultiProof {
     }
 }
 
-/// Generate an aggregated multiproof for multiple keys.
+// ============================================================
+// Proof generation and verification
+// ============================================================
+
+/// Generate a verkle proof for one or more keys.
 ///
-/// Traverses the tree for each key, collects all openings, deduplicates
-/// shared nodes, and aggregates everything into a single multipoint proof.
-pub fn prove_aggregated<S: TreeReader>(
-    store: &S,
-    root_key: &NodeKey,
-    keys: &[Key],
-) -> Option<AggregatedMultiProof> {
+/// All openings across all keys are aggregated into a single 576-byte
+/// multipoint proof via the Dankrad Feist scheme.
+pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Option<VerkleProof> {
     let crs = shared_crs();
     let precomp = &*PRECOMP;
 
-    // Traverse tree for each key
     let mut key_data = Vec::with_capacity(keys.len());
     let mut all_prover_queries = Vec::new();
     let mut verifier_queries_out = Vec::new();
 
-    // Deduplicate: track which (commitment, index) pairs we've already seen
-    // to avoid duplicate queries. Key = (commitment_bytes, index).
+    // Deduplicate: track (commitment, index) pairs we've already seen.
     let mut seen: HashMap<([u8; 32], usize), usize> = HashMap::new();
 
     for key in keys {
@@ -309,7 +194,6 @@ pub fn prove_aggregated<S: TreeReader>(
         });
 
         for (comm, a, index, result) in &traversal.openings {
-            // Deduplicate by commitment + index
             use ark_serialize::CanonicalSerialize;
             let mut comm_bytes = [0u8; 32];
             comm.serialize_compressed(&mut comm_bytes[..]).unwrap();
@@ -331,8 +215,8 @@ pub fn prove_aggregated<S: TreeReader>(
     }
 
     if all_prover_queries.is_empty() {
-        // All keys hit root EaS directly, no internal nodes to prove
-        return Some(AggregatedMultiProof {
+        // All keys hit root EaS directly — no internal nodes to prove
+        return Some(VerkleProof {
             multipoint_proof: MultiPointProof {
                 ipa_proof: crate::multiproof::ipa::IPAProof {
                     l_vec: vec![],
@@ -346,20 +230,19 @@ pub fn prove_aggregated<S: TreeReader>(
         });
     }
 
-    // Generate the aggregated multipoint proof
-    let mut transcript = Transcript::new(b"jvt_verkle_multiproof");
+    let mut transcript = Transcript::new(b"jvt_verkle_proof");
     let proof = MultiPointProver::open(crs, precomp, &mut transcript, all_prover_queries);
 
-    Some(AggregatedMultiProof {
+    Some(VerkleProof {
         multipoint_proof: proof,
         key_data,
         verifier_queries: verifier_queries_out,
     })
 }
 
-/// Verify an aggregated multiproof.
-pub fn verify_aggregated(
-    proof: &AggregatedMultiProof,
+/// Verify a verkle proof.
+pub fn verify(
+    proof: &VerkleProof,
     root_commitment: Commitment,
     keys: &[Key],
     expected_values: &[Option<Value>],
@@ -393,11 +276,9 @@ pub fn verify_aggregated(
     }
 
     // Verify the first query's commitment matches the root
-    if !proof.verifier_queries.is_empty() {
-        let first_comm = Commitment(proof.verifier_queries[0].0);
-        if first_comm != root_commitment {
-            return false;
-        }
+    let first_comm = Commitment(proof.verifier_queries[0].0);
+    if first_comm != root_commitment {
+        return false;
     }
 
     // Reconstruct verifier queries and verify the multipoint proof
@@ -414,10 +295,33 @@ pub fn verify_aggregated(
         })
         .collect();
 
-    let mut transcript = Transcript::new(b"jvt_verkle_multiproof");
+    let mut transcript = Transcript::new(b"jvt_verkle_proof");
     proof
         .multipoint_proof
         .check(crs, precomp, &vqs, &mut transcript)
+}
+
+// ============================================================
+// Convenience: single-key prove/verify
+// ============================================================
+
+/// Generate a verkle proof for a single key.
+pub fn prove_single<S: TreeReader>(
+    store: &S,
+    root_key: &NodeKey,
+    key: &Key,
+) -> Option<VerkleProof> {
+    prove(store, root_key, &[*key])
+}
+
+/// Verify a single-key verkle proof.
+pub fn verify_single(
+    proof: &VerkleProof,
+    root_commitment: Commitment,
+    key: &Key,
+    expected_value: Option<&Value>,
+) -> bool {
+    verify(proof, root_commitment, &[*key], &[expected_value.cloned()])
 }
 
 // ============================================================
@@ -452,24 +356,27 @@ mod tests {
         root_commitment_at(store, store.latest_version().unwrap())
     }
 
-    // --- Individual proof tests ---
+    // --- Single-key proof tests ---
 
     #[test]
-    fn real_proof_single_key() {
+    fn single_key_proof() {
         let mut store = MemoryStore::new();
         let key = make_key(1, 2, 3);
         let value = vec![42];
         insert(&mut store, key, value.clone());
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove(&store, rk, &key).unwrap();
-        assert!(proof.inclusion);
-        assert_eq!(proof.value, Some(value.clone()));
-        assert!(verify(&proof, root_c(&store), &key, Some(&value)));
+        let proof = prove_single(&store, rk, &key).unwrap();
+
+        assert_eq!(proof.key_data.len(), 1);
+        assert!(proof.key_data[0].inclusion);
+        assert_eq!(proof.key_data[0].value, Some(value.clone()));
+
+        assert!(verify_single(&proof, root_c(&store), &key, Some(&value)));
     }
 
     #[test]
-    fn real_proof_after_split() {
+    fn single_key_after_split() {
         let mut store = MemoryStore::new();
         insert(&mut store, make_key(1, 0, 0), vec![10]);
         insert(&mut store, make_key(2, 0, 0), vec![20]);
@@ -477,58 +384,47 @@ mod tests {
         let rk = store.latest_root_key().unwrap();
         let rc = root_c(&store);
 
-        let p1 = prove(&store, rk, &make_key(1, 0, 0)).unwrap();
-        assert!(verify(&p1, rc, &make_key(1, 0, 0), Some(&vec![10])));
+        let p1 = prove_single(&store, rk, &make_key(1, 0, 0)).unwrap();
+        assert!(verify_single(&p1, rc, &make_key(1, 0, 0), Some(&vec![10])));
 
-        let p2 = prove(&store, rk, &make_key(2, 0, 0)).unwrap();
-        assert!(verify(&p2, rc, &make_key(2, 0, 0), Some(&vec![20])));
+        let p2 = prove_single(&store, rk, &make_key(2, 0, 0)).unwrap();
+        assert!(verify_single(&p2, rc, &make_key(2, 0, 0), Some(&vec![20])));
     }
 
-    // --- Aggregated multiproof tests ---
-
     #[test]
-    fn aggregated_proof_single_key() {
+    fn single_key_nonexistent() {
         let mut store = MemoryStore::new();
-        let key = make_key(1, 2, 3);
-        let value = vec![42];
-        insert(&mut store, key, value.clone());
+        insert(&mut store, make_key(1, 2, 3), vec![42]);
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove_aggregated(&store, rk, &[key]).unwrap();
-        assert!(verify_aggregated(
+        let key2 = make_key(5, 6, 7);
+        let proof = prove_single(&store, rk, &key2).unwrap();
+        assert!(verify_single(&proof, root_c(&store), &key2, None));
+    }
+
+    // --- Batch proof tests ---
+
+    #[test]
+    fn batch_two_keys() {
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        insert(&mut store, make_key(2, 0, 0), vec![20]);
+
+        let rk = store.latest_root_key().unwrap();
+        let keys = [make_key(1, 0, 0), make_key(2, 0, 0)];
+        let proof = prove(&store, rk, &keys).unwrap();
+
+        assert_eq!(proof.proof_byte_size(), 576);
+        assert!(verify(
             &proof,
             root_c(&store),
-            &[key],
-            &[Some(value)]
+            &keys,
+            &[Some(vec![10]), Some(vec![20])],
         ));
     }
 
     #[test]
-    fn aggregated_proof_two_keys() {
-        let mut store = MemoryStore::new();
-        insert(&mut store, make_key(1, 0, 0), vec![10]);
-        insert(&mut store, make_key(2, 0, 0), vec![20]);
-
-        let rk = store.latest_root_key().unwrap();
-        let rc = root_c(&store);
-
-        let proof = prove_aggregated(&store, rk, &[make_key(1, 0, 0), make_key(2, 0, 0)]).unwrap();
-        println!(
-            "Aggregated proof (2 keys): {} bytes proof, {} bytes total",
-            proof.proof_byte_size(),
-            proof.total_byte_size()
-        );
-        assert_eq!(proof.proof_byte_size(), 576);
-        assert!(verify_aggregated(
-            &proof,
-            rc,
-            &[make_key(1, 0, 0), make_key(2, 0, 0)],
-            &[Some(vec![10]), Some(vec![20])]
-        ));
-    }
-
-    #[test]
-    fn aggregated_proof_many_keys() {
+    fn batch_many_keys() {
         let mut store = MemoryStore::new();
         let keys: Vec<Key> = (0..20u8)
             .map(|i| make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)))
@@ -539,75 +435,66 @@ mod tests {
         }
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove_aggregated(&store, rk, &keys).unwrap();
-        println!(
-            "Aggregated proof (20 keys): {} bytes proof, {} openings",
-            proof.proof_byte_size(),
-            proof.verifier_queries.len()
-        );
+        let proof = prove(&store, rk, &keys).unwrap();
         assert_eq!(proof.proof_byte_size(), 576);
 
         let expected: Vec<Option<Value>> = values.into_iter().map(Some).collect();
-        assert!(verify_aggregated(&proof, root_c(&store), &keys, &expected));
+        assert!(verify(&proof, root_c(&store), &keys, &expected));
     }
 
     #[test]
-    fn aggregated_proof_rejects_wrong_value() {
+    fn batch_rejects_wrong_value() {
         let mut store = MemoryStore::new();
         insert(&mut store, make_key(1, 0, 0), vec![10]);
         insert(&mut store, make_key(2, 0, 0), vec![20]);
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove_aggregated(&store, rk, &[make_key(1, 0, 0), make_key(2, 0, 0)]).unwrap();
-        assert!(!verify_aggregated(
+        let keys = [make_key(1, 0, 0), make_key(2, 0, 0)];
+        let proof = prove(&store, rk, &keys).unwrap();
+
+        assert!(!verify(
             &proof,
             root_c(&store),
-            &[make_key(1, 0, 0), make_key(2, 0, 0)],
-            &[Some(vec![10]), Some(vec![99])]
+            &keys,
+            &[Some(vec![10]), Some(vec![99])],
         ));
     }
 
     #[test]
-    fn aggregated_proof_with_shared_internal_nodes() {
+    fn batch_shared_internal_nodes() {
         let mut store = MemoryStore::new();
         insert(&mut store, make_key(5, 1, 0), vec![10]);
         insert(&mut store, make_key(5, 2, 0), vec![20]);
         insert(&mut store, make_key(6, 0, 0), vec![30]);
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove_aggregated(
-            &store,
-            rk,
-            &[make_key(5, 1, 0), make_key(5, 2, 0), make_key(6, 0, 0)],
-        )
-        .unwrap();
-        println!(
-            "Shared nodes proof (3 keys): {} bytes proof, {} openings (deduplicated)",
-            proof.proof_byte_size(),
-            proof.verifier_queries.len()
-        );
-        assert!(verify_aggregated(
+        let keys = [make_key(5, 1, 0), make_key(5, 2, 0), make_key(6, 0, 0)];
+        let proof = prove(&store, rk, &keys).unwrap();
+
+        assert!(verify(
             &proof,
             root_c(&store),
-            &[make_key(5, 1, 0), make_key(5, 2, 0), make_key(6, 0, 0)],
-            &[Some(vec![10]), Some(vec![20]), Some(vec![30])]
+            &keys,
+            &[Some(vec![10]), Some(vec![20]), Some(vec![30])],
         ));
     }
 
     #[test]
-    fn aggregated_proof_nonexistent_key() {
+    fn batch_with_nonexistent_key() {
         let mut store = MemoryStore::new();
         insert(&mut store, make_key(1, 0, 0), vec![10]);
         insert(&mut store, make_key(2, 0, 0), vec![20]);
 
         let rk = store.latest_root_key().unwrap();
         let key3 = make_key(1, 99, 0);
-        let proof = prove_aggregated(&store, rk, &[make_key(1, 0, 0), key3]).unwrap();
-        assert!(verify_aggregated(
+        let keys = [make_key(1, 0, 0), key3];
+        let proof = prove(&store, rk, &keys).unwrap();
+
+        assert!(verify(
             &proof,
             root_c(&store),
-            &[make_key(1, 0, 0), key3],
-            &[Some(vec![10]), None]
+            &keys,
+            &[Some(vec![10]), None],
         ));
     }
 }

@@ -11,7 +11,6 @@
 //! - `verify_commitment_consistency(store, root_key) -> bool`
 
 pub mod commitment;
-pub mod ipa;
 pub mod multiproof;
 pub mod node;
 pub mod proof;
