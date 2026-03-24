@@ -42,31 +42,61 @@ pub fn apply_updates<S: TreeReader>(
     updates: BTreeMap<Key, Option<Value>>,
 ) -> UpdateResult {
     let mut overlay = OverlayStore::new(store);
-    let mut current_root_key: Option<NodeKey> =
-        parent_version.and_then(|v| store.get_root_key(v)).cloned();
+    // Resolve the parent root — only set current_root_key if the node actually exists
+    let mut current_root_key: Option<NodeKey> = parent_version
+        .and_then(|v| store.get_root_key(v))
+        .filter(|rk| store.get_node(rk).is_some())
+        .cloned();
     let mut batch = TreeUpdateBatch::default();
 
     for (key, value) in updates {
-        let value = match value {
-            Some(v) => v,
-            None => continue, // TODO: delete support
+        let result = match value {
+            Some(v) => {
+                if let Some(ref root_key) = current_root_key {
+                    MutationResult::Updated(insert_single(
+                        &overlay,
+                        root_key,
+                        &key,
+                        v,
+                        0,
+                        new_version,
+                    ))
+                } else {
+                    // First insert into empty tree
+                    let stem = key[..31].to_vec();
+                    let suffix = key[31];
+                    let eas = EaSNode::new_single(stem, suffix, v);
+                    let commitment = eas.commitment();
+                    let root_key = NodeKey::root(new_version);
+                    let mut b = TreeUpdateBatch::default();
+                    b.put_node(root_key.clone(), Node::EaS(eas));
+                    MutationResult::Updated(InsertResult {
+                        new_node_key: root_key,
+                        new_commitment: commitment,
+                        batch: b,
+                    })
+                }
+            }
+            None => {
+                if let Some(ref root_key) = current_root_key {
+                    delete_single(&overlay, root_key, &key, 0, new_version)
+                } else {
+                    MutationResult::Unchanged // delete from empty tree = no-op
+                }
+            }
         };
 
-        let result = if let Some(ref root_key) = current_root_key {
-            insert_single(&overlay, root_key, &key, value, 0, new_version)
-        } else {
-            // First insert into empty tree
-            let stem = key[..31].to_vec();
-            let suffix = key[31];
-            let eas = EaSNode::new_single(stem, suffix, value);
-            let commitment = eas.commitment();
-            let root_key = NodeKey::root(new_version);
-            let mut b = TreeUpdateBatch::default();
-            b.put_node(root_key.clone(), Node::EaS(eas));
-            InsertResult {
-                new_node_key: root_key,
-                new_commitment: commitment,
-                batch: b,
+        let result = match result {
+            MutationResult::Updated(r) => r,
+            MutationResult::Unchanged => continue,
+            MutationResult::Removed(b) => {
+                // The entire tree was deleted (root EaS had only this key)
+                for (nk, node) in &b.new_nodes {
+                    overlay.put(nk.clone(), node.clone());
+                }
+                current_root_key = None;
+                batch.stale_nodes.extend(b.stale_nodes);
+                continue;
             }
         };
 
@@ -80,21 +110,37 @@ pub fn apply_updates<S: TreeReader>(
         batch.stale_nodes.extend(result.batch.stale_nodes);
     }
 
-    let root_key = current_root_key.unwrap_or_else(|| NodeKey::root(new_version));
-    let root_commitment = batch
-        .new_nodes
-        .iter()
-        .rev()
-        .find(|(nk, _)| *nk == root_key)
-        .map(|(_, node)| node.commitment())
-        .unwrap_or_else(zero_commitment);
+    match current_root_key {
+        Some(root_key) => {
+            let root_commitment = batch
+                .new_nodes
+                .iter()
+                .rev()
+                .find(|(nk, _)| *nk == root_key)
+                .map(|(_, node)| node.commitment())
+                .unwrap_or_else(zero_commitment);
 
-    batch.root_key = Some((new_version, root_key.clone()));
+            batch.root_key = Some((new_version, root_key.clone()));
 
-    UpdateResult {
-        root_commitment,
-        root_key,
-        batch,
+            UpdateResult {
+                root_commitment,
+                root_key,
+                batch,
+            }
+        }
+        None => {
+            // Tree is empty (all keys deleted or no inserts).
+            // Store a root key that points to nothing — get_value returns None
+            // for any key, and the next apply_updates with this version as parent
+            // will correctly start a fresh tree.
+            let root_key = NodeKey::root(new_version);
+            batch.root_key = Some((new_version, root_key.clone()));
+            UpdateResult {
+                root_commitment: zero_commitment(),
+                root_key,
+                batch,
+            }
+        }
     }
 }
 
@@ -218,6 +264,17 @@ struct InsertResult {
     new_node_key: NodeKey,
     new_commitment: Commitment,
     batch: TreeUpdateBatch,
+}
+
+/// Result of a mutation (insert or delete).
+enum MutationResult {
+    /// Node was updated — new node replaces the old one.
+    Updated(InsertResult),
+    /// Node was removed entirely (delete emptied the last value).
+    /// Contains only stale node entries.
+    Removed(TreeUpdateBatch),
+    /// Nothing changed (e.g., deleting a non-existent key).
+    Unchanged,
 }
 
 fn insert_single<S: TreeReader>(
@@ -478,6 +535,159 @@ fn insert_into_internal_empty(
 }
 
 // ============================================================
+// Internal: single-key delete
+// ============================================================
+
+fn delete_single<S: TreeReader>(
+    store: &S,
+    current_key: &NodeKey,
+    key: &Key,
+    depth: usize,
+    version: u64,
+) -> MutationResult {
+    let current_node = match store.get_node(current_key) {
+        Some(n) => n.clone(),
+        None => return MutationResult::Unchanged,
+    };
+
+    match current_node {
+        Node::EaS(mut eas) => {
+            let expected_stem = &key[depth..31];
+            if eas.stem != expected_stem {
+                return MutationResult::Unchanged; // wrong stem, key doesn't exist
+            }
+            let suffix = key[31];
+            if !eas.values.contains_key(&suffix) {
+                return MutationResult::Unchanged; // suffix slot empty, key doesn't exist
+            }
+
+            eas.values.remove(&suffix);
+
+            if eas.values.is_empty() {
+                // EaS is now empty — remove it entirely
+                let mut batch = TreeUpdateBatch::default();
+                batch.mark_stale(current_key.clone(), version);
+                MutationResult::Removed(batch)
+            } else {
+                // Recompute commitments with the value removed
+                let new_eas = EaSNode::from_values(eas.stem, eas.values);
+                let new_key = NodeKey::new(version, key[..depth].to_vec());
+                let commitment = new_eas.commitment();
+                let mut batch = TreeUpdateBatch::default();
+                batch.put_node(new_key.clone(), Node::EaS(new_eas));
+                batch.mark_stale(current_key.clone(), version);
+                MutationResult::Updated(InsertResult {
+                    new_node_key: new_key,
+                    new_commitment: commitment,
+                    batch,
+                })
+            }
+        }
+        Node::Internal(internal) => {
+            let child_index = key[depth];
+            let child = match internal.children.get(&child_index) {
+                Some(c) => c,
+                None => return MutationResult::Unchanged, // empty slot, key doesn't exist
+            };
+
+            let child_path: Vec<u8> = key[..depth + 1].to_vec();
+            let child_key = NodeKey::new(child.version, child_path);
+
+            let child_result = delete_single(store, &child_key, key, depth + 1, version);
+
+            match child_result {
+                MutationResult::Unchanged => MutationResult::Unchanged,
+                MutationResult::Updated(child_update) => {
+                    // Child was modified but still exists — update this internal node
+                    let mut new_internal = internal.clone();
+                    new_internal.update_child(
+                        child_index,
+                        Child {
+                            version,
+                            commitment: child_update.new_commitment,
+                        },
+                    );
+
+                    let new_key = NodeKey::new(version, key[..depth].to_vec());
+                    let commitment = new_internal.commitment;
+                    let mut batch = child_update.batch;
+                    batch.put_node(new_key.clone(), Node::Internal(new_internal));
+                    batch.mark_stale(current_key.clone(), version);
+                    MutationResult::Updated(InsertResult {
+                        new_node_key: new_key,
+                        new_commitment: commitment,
+                        batch,
+                    })
+                }
+                MutationResult::Removed(mut stale_batch) => {
+                    // Child was removed — remove it from this internal node
+                    stale_batch.mark_stale(current_key.clone(), version);
+
+                    let mut new_children = internal.children.clone();
+                    new_children.remove(&child_index);
+
+                    if new_children.is_empty() {
+                        // Internal node is now empty — remove it too
+                        MutationResult::Removed(stale_batch)
+                    } else if new_children.len() == 1 {
+                        // Single child remaining — try to collapse
+                        let (&remaining_idx, remaining_child) = new_children.iter().next().unwrap();
+                        let remaining_path: Vec<u8> = key[..depth]
+                            .iter()
+                            .chain(std::iter::once(&remaining_idx))
+                            .copied()
+                            .collect();
+                        let remaining_key = NodeKey::new(remaining_child.version, remaining_path);
+
+                        if let Some(Node::EaS(remaining_eas)) = store.get_node(&remaining_key) {
+                            // Collapse: merge the single-child internal + EaS into one EaS
+                            // with a longer stem (prepend the remaining_idx byte)
+                            let mut new_stem = vec![remaining_idx];
+                            new_stem.extend_from_slice(&remaining_eas.stem);
+                            let collapsed =
+                                EaSNode::from_values(new_stem, remaining_eas.values.clone());
+                            let collapsed_key = NodeKey::new(version, key[..depth].to_vec());
+                            let commitment = collapsed.commitment();
+                            stale_batch.put_node(collapsed_key.clone(), Node::EaS(collapsed));
+                            // The remaining child's old key is now stale too
+                            stale_batch.mark_stale(remaining_key, version);
+                            MutationResult::Updated(InsertResult {
+                                new_node_key: collapsed_key,
+                                new_commitment: commitment,
+                                batch: stale_batch,
+                            })
+                        } else {
+                            // Remaining child is an internal node — can't collapse,
+                            // just update this node with fewer children
+                            let new_internal = InternalNode::new(new_children);
+                            let new_key = NodeKey::new(version, key[..depth].to_vec());
+                            let commitment = new_internal.commitment;
+                            stale_batch.put_node(new_key.clone(), Node::Internal(new_internal));
+                            MutationResult::Updated(InsertResult {
+                                new_node_key: new_key,
+                                new_commitment: commitment,
+                                batch: stale_batch,
+                            })
+                        }
+                    } else {
+                        // Multiple children remain — just update the internal node
+                        let new_internal = InternalNode::new(new_children);
+                        let new_key = NodeKey::new(version, key[..depth].to_vec());
+                        let commitment = new_internal.commitment;
+                        stale_batch.put_node(new_key.clone(), Node::Internal(new_internal));
+                        MutationResult::Updated(InsertResult {
+                            new_node_key: new_key,
+                            new_commitment: commitment,
+                            batch: stale_batch,
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -681,6 +891,159 @@ mod tests {
             let key = make_key(i, i.wrapping_mul(3), i.wrapping_mul(7));
             assert_eq!(get(&store, &key), Some(vec![i]));
         }
+        let root = store.latest_root_key().unwrap();
+        assert!(verify_commitment_consistency(&store, root));
+    }
+
+    // --- Delete tests ---
+
+    /// Helper: delete a key.
+    fn delete(store: &mut MemoryStore, key: Key) {
+        let parent = store.latest_version();
+        let new_version = parent.map_or(1, |v| v + 1);
+        let mut updates = BTreeMap::new();
+        updates.insert(key, None);
+        let result = apply_updates(store, parent, new_version, updates);
+        store.apply(&result);
+    }
+
+    #[test]
+    fn delete_single_key() {
+        let mut store = MemoryStore::new();
+        let key = make_key(1, 0, 0);
+        insert(&mut store, key, vec![42]);
+        assert_eq!(get(&store, &key), Some(vec![42]));
+
+        delete(&mut store, key);
+        assert_eq!(get(&store, &key), None);
+    }
+
+    #[test]
+    fn delete_one_of_two_keys() {
+        let mut store = MemoryStore::new();
+        let key1 = make_key(1, 0, 0);
+        let key2 = make_key(2, 0, 0);
+        insert(&mut store, key1, vec![10]);
+        insert(&mut store, key2, vec![20]);
+
+        delete(&mut store, key1);
+
+        assert_eq!(get(&store, &key1), None);
+        assert_eq!(get(&store, &key2), Some(vec![20]));
+
+        let root = store.latest_root_key().unwrap();
+        assert!(verify_commitment_consistency(&store, root));
+    }
+
+    #[test]
+    fn delete_triggers_collapse() {
+        let mut store = MemoryStore::new();
+        // Create an internal node with two EaS children
+        let key1 = make_key(1, 0, 0);
+        let key2 = make_key(2, 0, 0);
+        insert(&mut store, key1, vec![10]);
+        insert(&mut store, key2, vec![20]);
+
+        // Delete one — should collapse the internal node back to a single EaS
+        delete(&mut store, key1);
+
+        // key2 should still work
+        assert_eq!(get(&store, &key2), Some(vec![20]));
+        let root = store.latest_root_key().unwrap();
+        assert!(verify_commitment_consistency(&store, root));
+
+        // The root should be an EaS now (collapsed), not an internal node
+        let root_node = store.get_node(root).unwrap();
+        assert!(matches!(root_node, Node::EaS(_)));
+    }
+
+    #[test]
+    fn delete_nonexistent_key_is_noop() {
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        let _v_before = store.latest_version();
+
+        delete(&mut store, make_key(99, 0, 0));
+
+        // Version still advances (the update was applied), but tree is unchanged
+        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(vec![10]));
+    }
+
+    #[test]
+    fn delete_same_stem_different_suffix() {
+        let mut store = MemoryStore::new();
+        let mut key1 = [0u8; 32];
+        key1[0] = 1;
+        key1[31] = 10;
+        let mut key2 = [0u8; 32];
+        key2[0] = 1;
+        key2[31] = 20;
+
+        insert(&mut store, key1, vec![100]);
+        insert(&mut store, key2, vec![200]);
+
+        // Delete one suffix, keep the other
+        delete(&mut store, key1);
+
+        assert_eq!(get(&store, &key1), None);
+        assert_eq!(get(&store, &key2), Some(vec![200]));
+        let root = store.latest_root_key().unwrap();
+        assert!(verify_commitment_consistency(&store, root));
+    }
+
+    #[test]
+    fn delete_all_keys() {
+        let mut store = MemoryStore::new();
+        let key1 = make_key(1, 0, 0);
+        let key2 = make_key(2, 0, 0);
+        insert(&mut store, key1, vec![10]);
+        insert(&mut store, key2, vec![20]);
+
+        delete(&mut store, key1);
+        delete(&mut store, key2);
+
+        assert_eq!(get(&store, &key1), None);
+        assert_eq!(get(&store, &key2), None);
+    }
+
+    #[test]
+    fn insert_after_delete() {
+        let mut store = MemoryStore::new();
+        let key = make_key(1, 0, 0);
+
+        insert(&mut store, key, vec![10]);
+        delete(&mut store, key);
+        assert_eq!(get(&store, &key), None);
+
+        insert(&mut store, key, vec![20]);
+        assert_eq!(get(&store, &key), Some(vec![20]));
+
+        let root = store.latest_root_key().unwrap();
+        assert!(verify_commitment_consistency(&store, root));
+    }
+
+    #[test]
+    fn batch_insert_and_delete() {
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        insert(&mut store, make_key(2, 0, 0), vec![20]);
+        insert(&mut store, make_key(3, 0, 0), vec![30]);
+
+        // Batch: delete key1, update key2, insert key4
+        let parent = store.latest_version();
+        let new_version = parent.map_or(1, |v| v + 1);
+        let mut updates = BTreeMap::new();
+        updates.insert(make_key(1, 0, 0), None);
+        updates.insert(make_key(2, 0, 0), Some(vec![99]));
+        updates.insert(make_key(4, 0, 0), Some(vec![40]));
+        let result = apply_updates(&store, parent, new_version, updates);
+        store.apply(&result);
+
+        assert_eq!(get(&store, &make_key(1, 0, 0)), None);
+        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(vec![99]));
+        assert_eq!(get(&store, &make_key(3, 0, 0)), Some(vec![30]));
+        assert_eq!(get(&store, &make_key(4, 0, 0)), Some(vec![40]));
+
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, root));
     }

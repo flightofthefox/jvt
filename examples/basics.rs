@@ -86,7 +86,7 @@ fn main() {
 
     let val = get_value(&store, store.latest_root_key().unwrap(), &key_dave);
     println!(
-        "   get(dave) = {:?} (expected None, but delete is not yet implemented)",
+        "   get(dave) = {:?} (expected None)",
         val.as_ref().map(|v| String::from_utf8_lossy(v))
     );
 
