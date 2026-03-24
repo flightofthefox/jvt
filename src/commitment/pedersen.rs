@@ -28,6 +28,11 @@ static BASIS: LazyLock<Vec<EdwardsProjective>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Get the pre-computed basis points (for use by the IPA module).
+pub fn get_basis() -> &'static [EdwardsProjective] {
+    &*BASIS
+}
+
 /// A Pedersen commitment (an elliptic curve point on Bandersnatch).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Commitment(pub EdwardsAffine);
