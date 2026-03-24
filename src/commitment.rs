@@ -9,7 +9,7 @@
 use std::fmt;
 use std::sync::LazyLock;
 
-use ark_ec::CurveGroup;
+use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, EdwardsProjective, Fr};
 use ark_ff::{AdditiveGroup, PrimeField};
 use ark_std::Zero;
@@ -17,11 +17,19 @@ use ark_std::Zero;
 /// Number of basis points (one per child slot in 256-ary branching).
 const WIDTH: usize = 256;
 
-/// Get the pre-computed basis points from the shared CRS.
+/// Get the pre-computed basis points (affine) from the shared CRS.
 /// This ensures the tree's commitments use the same generators as the
 /// multiproof system, so proofs verify correctly.
-pub fn get_basis() -> &'static [EdwardsProjective] {
+pub fn get_basis_affine() -> &'static [EdwardsAffine] {
     &crate::multiproof::crs::shared_crs().g
+}
+
+/// Get the pre-computed basis points in projective form for scalar multiplication.
+static BASIS_PROJECTIVE: LazyLock<Vec<EdwardsProjective>> =
+    LazyLock::new(|| get_basis_affine().iter().map(|p| (*p).into()).collect());
+
+pub fn get_basis() -> &'static [EdwardsProjective] {
+    &BASIS_PROJECTIVE
 }
 
 /// Precomputed table: `BYTE_BASIS[position][byte_value]` = `field_from_byte(byte_value) * G_position`.
@@ -111,17 +119,30 @@ pub fn field_one() -> FieldElement {
 }
 
 /// Compute a vector commitment: C = Σ values[i] * G_i.
+///
+/// Uses Pippenger MSM for large inputs (>= 8 elements), naive scalar
+/// multiplication for small sparse inputs.
 pub fn commit<I>(values: I) -> Commitment
 where
     I: IntoIterator<Item = (usize, FieldElement)>,
 {
-    let basis = get_basis();
-    let mut acc = EdwardsProjective::zero();
-    for (i, v) in values {
-        debug_assert!(i < WIDTH, "commitment index out of range");
-        acc += basis[i] * v.0;
+    let basis_affine = get_basis_affine();
+    let pairs: Vec<(usize, FieldElement)> = values.into_iter().collect();
+
+    if pairs.len() >= 8 {
+        let points: Vec<EdwardsAffine> = pairs.iter().map(|(i, _)| basis_affine[*i]).collect();
+        let scalars: Vec<Fr> = pairs.iter().map(|(_, v)| v.0).collect();
+        let result = EdwardsProjective::msm(&points, &scalars).expect("length mismatch");
+        Commitment(result.into_affine())
+    } else {
+        let basis = get_basis();
+        let mut acc = EdwardsProjective::zero();
+        for (i, v) in pairs {
+            debug_assert!(i < WIDTH, "commitment index out of range");
+            acc += basis[i] * v.0;
+        }
+        Commitment(acc.into_affine())
     }
-    Commitment(acc.into_affine())
 }
 
 /// Homomorphic update: C_new = C_old + (new_value - old_value) * G_index.

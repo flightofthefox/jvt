@@ -51,7 +51,7 @@ pub fn create(
 ) -> IPAProof {
     transcript.domain_sep(b"ipa");
 
-    let mut g = crs.g.clone();
+    let mut g: Vec<EdwardsProjective> = crs.g.iter().map(|p| (*p).into()).collect();
     let n = g.len();
     assert_eq!(a_vec.len(), n);
     assert_eq!(b_vec.len(), n);
@@ -81,9 +81,9 @@ pub fn create(
         let z_r = inner_product(a_l, b_r);
 
         // L = <a_R, G_L> + z_L * Q
-        let l: EdwardsProjective = CRS::msm(a_r, g_l) + q * z_l;
+        let l: EdwardsProjective = CRS::msm_proj(a_r, g_l) + q * z_l;
         // R = <a_L, G_R> + z_R * Q
-        let r: EdwardsProjective = CRS::msm(a_l, g_r) + q * z_r;
+        let r: EdwardsProjective = CRS::msm_proj(a_l, g_r) + q * z_r;
 
         let l_affine = l.into_affine();
         let r_affine = r.into_affine();
@@ -183,24 +183,24 @@ pub fn verify_multiexp(
     // Final check: 0 = Σ x_i * L_i + Σ x_inv_i * R_i + 1 * a_comm + q_scalar * Q + Σ g_coeffs_i * G_i
     // All terms should sum to zero (the identity point).
     let mut scalars = Vec::with_capacity(2 * logn + 2 + n);
-    let mut points = Vec::with_capacity(2 * logn + 2 + n);
+    let mut points: Vec<EdwardsAffine> = Vec::with_capacity(2 * logn + 2 + n);
 
     // L terms: x_i * L_i
     for (i, x) in challenges.iter().enumerate() {
         scalars.push(*x);
-        points.push(proof.l_vec[i].into());
+        points.push(proof.l_vec[i]);
     }
     // R terms: x_inv_i * R_i
     for (i, x_inv) in challenges_inv.iter().enumerate() {
         scalars.push(*x_inv);
-        points.push(proof.r_vec[i].into());
+        points.push(proof.r_vec[i]);
     }
     // a_comm term
     scalars.push(Fr::from(1u64));
-    points.push(a_comm.into());
+    points.push(a_comm);
     // Q term
     scalars.push(q_scalar);
-    points.push(crs.q);
+    points.push(crs.q.into_affine());
     // G terms
     for (i, coeff) in g_coeffs.iter().enumerate() {
         scalars.push(*coeff);

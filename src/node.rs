@@ -214,8 +214,8 @@ impl EaSNode {
         let table = byte_basis_table();
         let basis = get_basis();
 
-        // marker byte (1) at index 0
-        let mut acc: EdwardsProjective = basis[0] * field_one().0;
+        // marker byte (1) at index 0 — just the generator itself
+        let mut acc: EdwardsProjective = basis[0];
 
         // stem bytes via precomputed table — point addition, not scalar mul
         for (i, &byte) in stem.iter().enumerate() {

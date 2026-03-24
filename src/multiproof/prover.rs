@@ -210,8 +210,7 @@ impl MultiPointProof {
             .map(|(i, q)| powers_of_r[i] * helper_den[q.point])
             .collect();
 
-        let commitments: Vec<EdwardsProjective> =
-            queries.iter().map(|q| q.commitment.into()).collect();
+        let commitments: Vec<EdwardsAffine> = queries.iter().map(|q| q.commitment).collect();
         let e_comm: EdwardsAffine = CRS::msm(&msm_scalars, &commitments).into_affine();
 
         transcript.append_point(b"E", &e_comm);

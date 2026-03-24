@@ -3,15 +3,18 @@
 //! Contains the generator points G_0..G_{n-1} and the independent point Q
 //! used for binding inner products to commitments.
 
-use ark_ec::CurveGroup;
+use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, EdwardsProjective, Fr};
 use ark_std::UniformRand;
 
 /// The Common Reference String: basis points and the Q point.
+///
+/// Generators are stored in affine form for efficient multi-scalar multiplication
+/// (arkworks Pippenger uses affine bases for faster mixed addition).
 #[derive(Clone)]
 pub struct CRS {
-    /// Generator points G_0, ..., G_{n-1}.
-    pub g: Vec<EdwardsProjective>,
+    /// Generator points G_0, ..., G_{n-1} in affine form.
+    pub g: Vec<EdwardsAffine>,
     /// Independent point Q for inner product binding.
     pub q: EdwardsProjective,
     /// Domain size.
@@ -27,7 +30,9 @@ impl CRS {
         let rng_seed: [u8; 32] = *hash.as_bytes();
         let mut rng = ark_std::rand::rngs::StdRng::from_seed(rng_seed);
 
-        let g: Vec<EdwardsProjective> = (0..n).map(|_| EdwardsProjective::rand(&mut rng)).collect();
+        let g_proj: Vec<EdwardsProjective> =
+            (0..n).map(|_| EdwardsProjective::rand(&mut rng)).collect();
+        let g = EdwardsProjective::normalize_batch(&g_proj);
         let q = EdwardsProjective::rand(&mut rng);
 
         Self { g, q, n }
@@ -36,30 +41,21 @@ impl CRS {
     /// Commit to a polynomial in Lagrange basis: C = Σ values[i] * G_i.
     pub fn commit_lagrange(&self, values: &[Fr]) -> EdwardsAffine {
         assert_eq!(values.len(), self.n);
-        let result: EdwardsProjective =
-            values.iter().zip(self.g.iter()).map(|(v, g)| *g * *v).sum();
-        result.into_affine()
+        EdwardsProjective::msm(&self.g, values)
+            .expect("length mismatch")
+            .into_affine()
     }
 
-    /// Multi-scalar multiplication: Σ scalars[i] * points[i].
-    pub fn msm(scalars: &[Fr], points: &[EdwardsProjective]) -> EdwardsProjective {
-        scalars
-            .iter()
-            .zip(points.iter())
-            .map(|(s, p)| *p * *s)
-            .sum()
+    /// Multi-scalar multiplication using Pippenger's algorithm (affine bases).
+    pub fn msm(scalars: &[Fr], points: &[EdwardsAffine]) -> EdwardsProjective {
+        EdwardsProjective::msm(points, scalars).expect("length mismatch")
     }
 
-    /// MSM with affine points (converts to projective internally).
-    pub fn msm_affine(scalars: &[Fr], points: &[EdwardsAffine]) -> EdwardsProjective {
-        scalars
-            .iter()
-            .zip(points.iter())
-            .map(|(s, p)| {
-                let proj: EdwardsProjective = (*p).into();
-                proj * *s
-            })
-            .sum()
+    /// Multi-scalar multiplication with projective points.
+    /// Used in the IPA prover where generators are folded into projective form.
+    pub fn msm_proj(scalars: &[Fr], points: &[EdwardsProjective]) -> EdwardsProjective {
+        let affine = EdwardsProjective::normalize_batch(points);
+        EdwardsProjective::msm(&affine, scalars).expect("length mismatch")
     }
 }
 
