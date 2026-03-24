@@ -262,12 +262,15 @@ impl EaSNode {
 
     /// Update a single value slot, recomputing commitments.
     pub fn update_value(&mut self, suffix: u8, new_value: Value) {
-        self.batch_update_values(std::iter::once((suffix, new_value)));
+        self.batch_update_values(std::iter::once((suffix, Some(new_value))));
     }
 
     /// Update multiple value slots, deferring expensive commitment_to_field
     /// and extension_commitment updates until all sub-commitment updates are done.
-    pub fn batch_update_values(&mut self, updates: impl IntoIterator<Item = (u8, Value)>) {
+    ///
+    /// `Some(value)` upserts, `None` deletes. Homomorphic in both cases:
+    /// delete is `commit_update(c, idx, old_field, field_zero())`.
+    pub fn batch_update_values(&mut self, updates: impl IntoIterator<Item = (u8, Option<Value>)>) {
         let mut c1_changed = false;
         let mut c2_changed = false;
         let old_c1_field = self.c1_field;
@@ -279,7 +282,10 @@ impl EaSNode {
                 .get(&suffix)
                 .map(|v| value_to_field(v))
                 .unwrap_or(field_zero());
-            let new_field = value_to_field(&new_value);
+            let new_field = new_value
+                .as_ref()
+                .map(|v| value_to_field(v))
+                .unwrap_or(field_zero());
 
             if suffix < 128 {
                 self.c1 = commit_update(self.c1, suffix as usize, old_field, new_field);
@@ -289,7 +295,10 @@ impl EaSNode {
                 c2_changed = true;
             }
 
-            self.values.insert(suffix, new_value);
+            match new_value {
+                Some(v) => self.values.insert(suffix, v),
+                None => self.values.remove(&suffix),
+            };
         }
 
         // Only compute commitment_to_field and update extension once per half

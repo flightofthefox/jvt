@@ -377,41 +377,24 @@ fn batch_apply_eas(
             return BatchResult::Unchanged;
         }
 
-        let mut new_values = eas.values.clone();
-        for suffix in &same_stem_deletes {
-            new_values.remove(suffix);
-        }
-        // Check: did deletes remove values that inserts will re-add?
-        // Apply inserts after deletes so inserts win
-        for &(suffix, value) in &same_stem_inserts {
-            new_values.insert(suffix, value.clone());
-        }
+        // Homomorphic updates for inserts and deletes on existing EaS.
+        // Delete is commit_update(c, idx, old, zero) — same math as insert.
+        let mut new_eas = (*eas).clone();
+        let updates = same_stem_deletes
+            .iter()
+            .map(|&suffix| (suffix, None))
+            .chain(
+                same_stem_inserts
+                    .iter()
+                    .map(|&(suffix, value)| (suffix, Some(value.clone()))),
+            );
+        new_eas.batch_update_values(updates);
 
-        if new_values.is_empty() {
+        if new_eas.values.is_empty() {
             batch.mark_stale(node_key.clone(), version);
             return BatchResult::Removed;
         }
 
-        // Use homomorphic updates for pure inserts/updates on existing EaS
-        if same_stem_deletes.is_empty() {
-            let mut new_eas = (*eas).clone();
-            new_eas.batch_update_values(
-                same_stem_inserts
-                    .iter()
-                    .map(|&(suffix, value)| (suffix, value.clone())),
-            );
-            let new_key = NodeKey::new(version, path.clone());
-            let commitment = new_eas.commitment();
-            batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));
-            batch.mark_stale(node_key.clone(), version);
-            return BatchResult::Changed(BatchNodeResult {
-                node_key: new_key,
-                commitment,
-            });
-        }
-
-        // Deletes present — recompute from scratch (simpler than tracking deltas)
-        let new_eas = EaSNode::from_values(eas.stem.clone(), new_values);
         let new_key = NodeKey::new(version, path.clone());
         let commitment = new_eas.commitment();
         batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));
