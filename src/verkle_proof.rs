@@ -1,15 +1,22 @@
 //! Verkle proof generation and verification.
 //!
-//! All proofs use the Dankrad Feist multipoint scheme, producing a constant
-//! 576-byte proof regardless of how many keys are included. Even single-key
-//! proofs go through the multipoint system — there's no separate code path.
+//! Proofs use the Dankrad Feist multipoint scheme (576 bytes constant).
+//! The verifier checks:
+//! 1. Each opening is cryptographically valid (multiproof)
+//! 2. Openings chain: result[i] == commitment_to_field(commitment[i+1])
+//! 3. First opening's commitment matches the root
+//! 4. EaS marker byte == 1 (prevents internal/extension commitment confusion)
+//! 5. Final opening's result matches the claimed value
+//! 6. Empty-slot non-inclusion: the opening result is zero
 
 use std::collections::HashMap;
 
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_ff::AdditiveGroup;
 
-use crate::commitment::{commitment_to_field, Commitment};
+use crate::commitment::{
+    commitment_to_field, field_from_byte, field_one, value_to_field, Commitment,
+};
 use crate::multiproof::crs::shared_crs;
 use crate::multiproof::lagrange::{LagrangeBasis, PrecomputedWeights};
 use crate::multiproof::prover::{MultiPointProof, MultiPointProver, ProverQuery, VerifierQuery};
@@ -17,18 +24,13 @@ use crate::multiproof::transcript::Transcript;
 use crate::node::*;
 use crate::storage::*;
 
-// ============================================================
-// Shared precomputed weights (lazy-initialized)
-// ============================================================
-
 static PRECOMP: std::sync::LazyLock<PrecomputedWeights> =
     std::sync::LazyLock::new(|| PrecomputedWeights::new(256));
 
 // ============================================================
-// Helpers
+// Vector reconstruction
 // ============================================================
 
-/// Reconstruct the 256-element scalar vector for an internal node.
 fn internal_node_vector(internal: &InternalNode) -> Vec<Fr> {
     let mut v = vec![Fr::ZERO; 256];
     for (&idx, child) in &internal.children {
@@ -37,16 +39,54 @@ fn internal_node_vector(internal: &InternalNode) -> Vec<Fr> {
     v
 }
 
-/// Data collected during tree traversal for one key.
-struct KeyTraversal {
-    openings: Vec<(EdwardsAffine, Vec<Fr>, usize, Fr)>,
-    eas_stem: Vec<u8>,
-    value: Option<Value>,
-    inclusion: bool,
-    depth: usize,
+fn eas_extension_vector(eas: &EaSNode) -> Vec<Fr> {
+    let mut v = vec![Fr::ZERO; 256];
+    v[0] = field_one().0;
+    for (i, &byte) in eas.stem.iter().enumerate() {
+        v[i + 1] = field_from_byte(byte).0;
+    }
+    v[eas.stem.len() + 1] = commitment_to_field(eas.c1).0;
+    v[eas.stem.len() + 2] = commitment_to_field(eas.c2).0;
+    v
 }
 
-/// Walk the tree for a key, collecting opening data without generating proofs.
+fn eas_sub_commitment_vector(eas: &EaSNode, is_c2: bool) -> Vec<Fr> {
+    let mut v = vec![Fr::ZERO; 256];
+    for (&suffix, val) in &eas.values {
+        if is_c2 && suffix >= 128 {
+            v[(suffix - 128) as usize] = value_to_field(val).0;
+        } else if !is_c2 && suffix < 128 {
+            v[suffix as usize] = value_to_field(val).0;
+        }
+    }
+    v
+}
+
+// ============================================================
+// Traversal
+// ============================================================
+
+type Opening = (EdwardsAffine, Vec<Fr>, usize, Fr);
+
+/// How the key lookup terminated.
+#[derive(Clone, Debug)]
+pub enum TerminationKind {
+    /// Found the EaS with matching stem. Value may or may not exist at suffix.
+    FoundEaS,
+    /// Hit an empty child slot in an internal node.
+    EmptySlot,
+    /// Found an EaS but stem doesn't match. `diverge_byte` is the first differing position.
+    StemMismatch { diverge_byte: usize },
+}
+
+struct KeyTraversal {
+    openings: Vec<Opening>,
+    eas_stem: Vec<u8>,
+    value: Option<Value>,
+    depth: usize,
+    termination: TerminationKind,
+}
+
 fn traverse_for_key<S: TreeReader>(
     store: &S,
     root_key: &NodeKey,
@@ -83,8 +123,8 @@ fn traverse_for_key<S: TreeReader>(
                             openings,
                             eas_stem: vec![],
                             value: None,
-                            inclusion: false,
                             depth,
+                            termination: TerminationKind::EmptySlot,
                         });
                     }
                 }
@@ -94,20 +134,87 @@ fn traverse_for_key<S: TreeReader>(
                 if eas.stem == expected_stem {
                     let suffix = key[31];
                     let value = eas.values.get(&suffix).cloned();
+                    let is_c2 = suffix >= 128;
+
+                    // Open the marker byte (index 0) to prove this is an EaS, not an internal node
+                    let ext_vec = eas_extension_vector(eas);
+                    openings.push((
+                        eas.extension_commitment.0,
+                        ext_vec.clone(),
+                        0, // marker index
+                        field_one().0,
+                    ));
+
+                    // Open extension → c1 or c2
+                    let sub_comm_index = if is_c2 {
+                        eas.stem.len() + 2
+                    } else {
+                        eas.stem.len() + 1
+                    };
+                    openings.push((
+                        eas.extension_commitment.0,
+                        ext_vec,
+                        sub_comm_index,
+                        commitment_to_field(if is_c2 { eas.c2 } else { eas.c1 }).0,
+                    ));
+
+                    // Open c1/c2 → value
+                    let sub_vec = eas_sub_commitment_vector(eas, is_c2);
+                    let sub_commitment = if is_c2 { eas.c2 } else { eas.c1 };
+                    let sub_index = if is_c2 {
+                        (suffix - 128) as usize
+                    } else {
+                        suffix as usize
+                    };
+                    let value_scalar = value
+                        .as_ref()
+                        .map(|v| value_to_field(v).0)
+                        .unwrap_or(Fr::ZERO);
+                    openings.push((sub_commitment.0, sub_vec, sub_index, value_scalar));
+
                     return Some(KeyTraversal {
                         openings,
                         eas_stem: eas.stem.clone(),
-                        value: value.clone(),
-                        inclusion: value.is_some(),
+                        value,
                         depth,
+                        termination: TerminationKind::FoundEaS,
                     });
                 } else {
+                    let diverge_pos = eas
+                        .stem
+                        .iter()
+                        .zip(expected_stem.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(eas.stem.len().min(expected_stem.len()));
+
+                    // Open marker byte to prove this is an EaS, not an internal node
+                    let ext_vec = eas_extension_vector(eas);
+                    openings.push((
+                        eas.extension_commitment.0,
+                        ext_vec.clone(),
+                        0,
+                        field_one().0,
+                    ));
+
+                    // Open at the divergent stem byte
+                    if diverge_pos < eas.stem.len() {
+                        let stem_index = diverge_pos + 1;
+                        openings.push((
+                            eas.extension_commitment.0,
+                            ext_vec,
+                            stem_index,
+                            field_from_byte(eas.stem[diverge_pos]).0,
+                        ));
+                    }
+
                     return Some(KeyTraversal {
                         openings,
                         eas_stem: eas.stem.clone(),
                         value: None,
-                        inclusion: false,
                         depth,
+                        termination: TerminationKind::StemMismatch {
+                            diverge_byte: diverge_pos,
+                        },
                     });
                 }
             }
@@ -119,58 +226,52 @@ fn traverse_for_key<S: TreeReader>(
 // Proof types
 // ============================================================
 
-/// Per-key metadata included in the proof.
+/// Per-key proof data with explicit path through the openings.
 #[derive(Clone, Debug)]
 pub struct KeyProofData {
     pub key: Key,
     pub eas_stem: Vec<u8>,
     pub value: Option<Value>,
-    pub inclusion: bool,
     pub depth: usize,
+    /// Indices into `VerkleProof::verifier_queries` forming this key's path.
+    pub query_path: Vec<usize>,
+    /// How the traversal terminated.
+    pub termination: TerminationKind,
 }
 
-/// A verkle proof using the Dankrad Feist multipoint scheme.
-///
-/// Contains a single `MultiPointProof` (~576 bytes) that covers ALL openings
-/// across ALL keys, plus per-key metadata and verifier query data needed
-/// to reconstruct the transcript during verification.
 #[derive(Clone, Debug)]
 pub struct VerkleProof {
-    /// The constant-size multipoint proof.
     pub multipoint_proof: MultiPointProof,
-    /// Per-key proof data (stem, value, inclusion).
     pub key_data: Vec<KeyProofData>,
-    /// Verifier query data: (commitment, point, result) for each opening.
     pub verifier_queries: Vec<(EdwardsAffine, usize, Fr)>,
 }
 
 impl VerkleProof {
-    /// The multipoint proof size (constant regardless of key count).
     pub fn proof_byte_size(&self) -> usize {
         self.multipoint_proof.byte_size()
     }
 
-    /// Total proof size including all metadata.
     pub fn total_byte_size(&self) -> usize {
         let proof_bytes = self.multipoint_proof.byte_size();
         let query_bytes = self.verifier_queries.len() * 65;
         let key_bytes: usize = self
             .key_data
             .iter()
-            .map(|kd| 32 + kd.eas_stem.len() + kd.value.as_ref().map_or(0, |v| v.len()) + 2)
+            .map(|kd| {
+                32 + kd.eas_stem.len()
+                    + kd.value.as_ref().map_or(0, |v| v.len())
+                    + kd.query_path.len() * 8
+                    + 4
+            })
             .sum();
         proof_bytes + query_bytes + key_bytes
     }
 }
 
 // ============================================================
-// Proof generation and verification
+// Proof generation
 // ============================================================
 
-/// Generate a verkle proof for one or more keys.
-///
-/// All openings across all keys are aggregated into a single 576-byte
-/// multipoint proof via the Dankrad Feist scheme.
 pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Option<VerkleProof> {
     let crs = shared_crs();
     let precomp = &*PRECOMP;
@@ -178,20 +279,11 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Opti
     let mut key_data = Vec::with_capacity(keys.len());
     let mut all_prover_queries = Vec::new();
     let mut verifier_queries_out = Vec::new();
-
-    // Deduplicate: track (commitment, index) pairs we've already seen.
     let mut seen: HashMap<([u8; 32], usize), usize> = HashMap::new();
 
     for key in keys {
         let traversal = traverse_for_key(store, root_key, key)?;
-
-        key_data.push(KeyProofData {
-            key: *key,
-            eas_stem: traversal.eas_stem,
-            value: traversal.value,
-            inclusion: traversal.inclusion,
-            depth: traversal.depth,
-        });
+        let mut query_path = Vec::with_capacity(traversal.openings.len());
 
         for (comm, a, index, result) in &traversal.openings {
             use ark_serialize::CanonicalSerialize;
@@ -199,23 +291,35 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Opti
             comm.serialize_compressed(&mut comm_bytes[..]).unwrap();
             let dedup_key = (comm_bytes, *index);
 
-            if seen.contains_key(&dedup_key) {
-                continue;
-            }
-            seen.insert(dedup_key, all_prover_queries.len());
+            let query_idx = if let Some(&existing_idx) = seen.get(&dedup_key) {
+                existing_idx
+            } else {
+                let idx = all_prover_queries.len();
+                seen.insert(dedup_key, idx);
+                all_prover_queries.push(ProverQuery {
+                    commitment: *comm,
+                    poly: LagrangeBasis::new(a.clone()),
+                    point: *index,
+                    result: *result,
+                });
+                verifier_queries_out.push((*comm, *index, *result));
+                idx
+            };
 
-            all_prover_queries.push(ProverQuery {
-                commitment: *comm,
-                poly: LagrangeBasis::new(a.clone()),
-                point: *index,
-                result: *result,
-            });
-            verifier_queries_out.push((*comm, *index, *result));
+            query_path.push(query_idx);
         }
+
+        key_data.push(KeyProofData {
+            key: *key,
+            eas_stem: traversal.eas_stem,
+            value: traversal.value,
+            depth: traversal.depth,
+            query_path,
+            termination: traversal.termination,
+        });
     }
 
     if all_prover_queries.is_empty() {
-        // All keys hit root EaS directly — no internal nodes to prove
         return Some(VerkleProof {
             multipoint_proof: MultiPointProof {
                 ipa_proof: crate::multiproof::ipa::IPAProof {
@@ -240,7 +344,10 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Opti
     })
 }
 
-/// Verify a verkle proof.
+// ============================================================
+// Verification
+// ============================================================
+
 pub fn verify(
     proof: &VerkleProof,
     root_commitment: Commitment,
@@ -251,7 +358,8 @@ pub fn verify(
         return false;
     }
 
-    // Check per-key data
+    let queries = &proof.verifier_queries;
+
     for (i, kd) in proof.key_data.iter().enumerate() {
         if kd.key != keys[i] {
             return false;
@@ -259,34 +367,121 @@ pub fn verify(
         if kd.value.as_ref() != expected_values[i].as_ref() {
             return false;
         }
-        if kd.inclusion != expected_values[i].is_some() {
+
+        // Stem check for inclusion
+        match &kd.termination {
+            TerminationKind::FoundEaS => {
+                let expected_stem = &keys[i][kd.depth..31];
+                if kd.eas_stem != expected_stem {
+                    return false;
+                }
+            }
+            _ => {
+                // Non-inclusion: value must be None
+                if expected_values[i].is_some() {
+                    return false;
+                }
+            }
+        }
+
+        if kd.query_path.is_empty() {
+            continue;
+        }
+
+        // --- Chain verification ---
+
+        // 1. First opening must match the root
+        let first_idx = kd.query_path[0];
+        if first_idx >= queries.len() {
             return false;
         }
-        if kd.inclusion {
-            let expected_stem = &keys[i][kd.depth..31];
-            if kd.eas_stem != expected_stem {
+        if Commitment(queries[first_idx].0) != root_commitment {
+            return false;
+        }
+
+        // 2. Consecutive openings chain together
+        for j in 0..kd.query_path.len() - 1 {
+            let curr_idx = kd.query_path[j];
+            let next_idx = kd.query_path[j + 1];
+            if curr_idx >= queries.len() || next_idx >= queries.len() {
                 return false;
+            }
+
+            let curr_result = queries[curr_idx].2;
+            let next_commitment_scalar = commitment_to_field(Commitment(queries[next_idx].0)).0;
+
+            // Chain link: result of this opening == scalar form of next commitment
+            // EXCEPT when two consecutive openings are on the SAME commitment
+            // (e.g., marker byte and sub-commitment opening on the same extension commitment).
+            // In that case, the chain link is that they share the same commitment, not
+            // that one's result maps to the other's commitment.
+            let same_commitment = queries[curr_idx].0 == queries[next_idx].0;
+            if !same_commitment && curr_result != next_commitment_scalar {
+                return false;
+            }
+        }
+
+        // 3. Termination-specific checks
+        let last_idx = *kd.query_path.last().unwrap();
+        if last_idx >= queries.len() {
+            return false;
+        }
+        let final_result = queries[last_idx].2;
+
+        match &kd.termination {
+            TerminationKind::FoundEaS => {
+                // Final result must match value_to_field(value)
+                let expected_scalar = kd
+                    .value
+                    .as_ref()
+                    .map(|v| value_to_field(v).0)
+                    .unwrap_or(Fr::ZERO);
+                if final_result != expected_scalar {
+                    return false;
+                }
+
+                // Verify marker byte == 1, proving this is an EaS (not an internal node)
+                let marker_ok = kd.query_path.iter().any(|&idx| {
+                    idx < queries.len() && queries[idx].1 == 0 && queries[idx].2 == field_one().0
+                });
+                if !marker_ok {
+                    return false;
+                }
+            }
+            TerminationKind::EmptySlot => {
+                // Empty child slot: the opening result must be zero
+                if final_result != Fr::ZERO {
+                    return false;
+                }
+            }
+            TerminationKind::StemMismatch { diverge_byte } => {
+                // The opened stem byte must differ from the key's stem byte
+                let key_stem_byte = keys[i][kd.depth + diverge_byte];
+                let key_byte_scalar = field_from_byte(key_stem_byte).0;
+                if final_result == key_byte_scalar {
+                    return false;
+                }
+
+                // Verify marker byte == 1 for stem-mismatch too
+                let marker_ok = kd.query_path.iter().any(|&idx| {
+                    idx < queries.len() && queries[idx].1 == 0 && queries[idx].2 == field_one().0
+                });
+                if !marker_ok {
+                    return false;
+                }
             }
         }
     }
 
-    // If no openings (all keys hit root EaS), just check per-key data
     if proof.verifier_queries.is_empty() {
         return true;
     }
 
-    // Verify the first query's commitment matches the root
-    let first_comm = Commitment(proof.verifier_queries[0].0);
-    if first_comm != root_commitment {
-        return false;
-    }
-
-    // Reconstruct verifier queries and verify the multipoint proof
+    // Verify all openings cryptographically
     let crs = shared_crs();
     let precomp = &*PRECOMP;
 
-    let vqs: Vec<VerifierQuery> = proof
-        .verifier_queries
+    let vqs: Vec<VerifierQuery> = queries
         .iter()
         .map(|(comm, point, result)| VerifierQuery {
             commitment: *comm,
@@ -302,10 +497,9 @@ pub fn verify(
 }
 
 // ============================================================
-// Convenience: single-key prove/verify
+// Convenience
 // ============================================================
 
-/// Generate a verkle proof for a single key.
 pub fn prove_single<S: TreeReader>(
     store: &S,
     root_key: &NodeKey,
@@ -314,7 +508,6 @@ pub fn prove_single<S: TreeReader>(
     prove(store, root_key, &[*key])
 }
 
-/// Verify a single-key verkle proof.
 pub fn verify_single(
     proof: &VerkleProof,
     root_commitment: Commitment,
@@ -356,8 +549,6 @@ mod tests {
         root_commitment_at(store, store.latest_version().unwrap())
     }
 
-    // --- Single-key proof tests ---
-
     #[test]
     fn single_key_proof() {
         let mut store = MemoryStore::new();
@@ -368,10 +559,8 @@ mod tests {
         let rk = store.latest_root_key().unwrap();
         let proof = prove_single(&store, rk, &key).unwrap();
 
-        assert_eq!(proof.key_data.len(), 1);
-        assert!(proof.key_data[0].inclusion);
-        assert_eq!(proof.key_data[0].value, Some(value.clone()));
-
+        // marker + extension→c1 + c1→value = 3 openings
+        assert_eq!(proof.key_data[0].query_path.len(), 3);
         assert!(verify_single(&proof, root_c(&store), &key, Some(&value)));
     }
 
@@ -392,17 +581,38 @@ mod tests {
     }
 
     #[test]
-    fn single_key_nonexistent() {
+    fn nonexistent_stem_mismatch() {
         let mut store = MemoryStore::new();
         insert(&mut store, make_key(1, 2, 3), vec![42]);
 
         let rk = store.latest_root_key().unwrap();
         let key2 = make_key(5, 6, 7);
         let proof = prove_single(&store, rk, &key2).unwrap();
+
+        assert!(matches!(
+            proof.key_data[0].termination,
+            TerminationKind::StemMismatch { .. }
+        ));
         assert!(verify_single(&proof, root_c(&store), &key2, None));
     }
 
-    // --- Batch proof tests ---
+    #[test]
+    fn nonexistent_empty_slot() {
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        insert(&mut store, make_key(2, 0, 0), vec![20]);
+
+        let rk = store.latest_root_key().unwrap();
+        // Key with first byte 3 — not in the tree, hits empty child slot
+        let key3 = make_key(3, 0, 0);
+        let proof = prove_single(&store, rk, &key3).unwrap();
+
+        assert!(matches!(
+            proof.key_data[0].termination,
+            TerminationKind::EmptySlot
+        ));
+        assert!(verify_single(&proof, root_c(&store), &key3, None));
+    }
 
     #[test]
     fn batch_two_keys() {
@@ -495,6 +705,26 @@ mod tests {
             root_c(&store),
             &keys,
             &[Some(vec![10]), None],
+        ));
+    }
+
+    #[test]
+    fn chain_catches_wrong_root() {
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        insert(&mut store, make_key(2, 0, 0), vec![20]);
+
+        let rk = store.latest_root_key().unwrap();
+        let proof = prove_single(&store, rk, &make_key(1, 0, 0)).unwrap();
+
+        insert(&mut store, make_key(3, 0, 0), vec![30]);
+        let new_root = root_c(&store);
+
+        assert!(!verify_single(
+            &proof,
+            new_root,
+            &make_key(1, 0, 0),
+            Some(&vec![10])
         ));
     }
 }
