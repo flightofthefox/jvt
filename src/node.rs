@@ -143,6 +143,8 @@ pub struct EaSNode {
     pub c1: Commitment,
     /// Commitment over values[128..255].
     pub c2: Commitment,
+    pub c1_field: FieldElement,
+    pub c2_field: FieldElement,
     /// Commitment over (1, stem_fields..., c1, c2).
     pub extension_commitment: Commitment,
 }
@@ -159,12 +161,18 @@ impl EaSNode {
     pub fn from_values(stem: Vec<u8>, values: HashMap<u8, Value>) -> Self {
         let c1 = Self::compute_c1(&values);
         let c2 = Self::compute_c2(&values);
-        let extension_commitment = Self::compute_extension_commitment(&stem, c1, c2);
+        let c1_field = commitment_to_field(c1);
+        let c2_field = commitment_to_field(c2);
+        let stem_c = Self::compute_stem_commitment(&stem);
+        let extension_commitment =
+            Self::compute_extension_commitment_from_stem_cached(stem_c, stem.len(), c1_field, c2_field);
         Self {
             stem,
             values,
             c1,
             c2,
+            c1_field,
+            c2_field,
             extension_commitment,
         }
     }
@@ -215,25 +223,34 @@ impl EaSNode {
         Commitment(acc.into_affine())
     }
 
+    /// Compute the extension commitment from a precomputed stem commitment
+    /// using pre-cached field elements for c1 and c2.
+    pub fn compute_extension_commitment_from_stem_cached(
+        stem_commitment: Commitment,
+        stem_len: usize,
+        c1_field: FieldElement,
+        c2_field: FieldElement,
+    ) -> Commitment {
+        let c = commit_update(stem_commitment, stem_len + 1, field_zero(), c1_field);
+        commit_update(c, stem_len + 2, field_zero(), c2_field)
+    }
+
     /// Compute the extension commitment from a precomputed stem commitment.
-    /// Only 2 scalar muls instead of stem.len() + 3.
     pub fn compute_extension_commitment_from_stem(
         stem_commitment: Commitment,
         stem_len: usize,
         c1: Commitment,
         c2: Commitment,
     ) -> Commitment {
-        let c = commit_update(
+        Self::compute_extension_commitment_from_stem_cached(
             stem_commitment,
-            stem_len + 1,
-            field_zero(),
+            stem_len,
             commitment_to_field(c1),
-        );
-        commit_update(c, stem_len + 2, field_zero(), commitment_to_field(c2))
+            commitment_to_field(c2),
+        )
     }
 
     /// Compute the extension commitment: commit(1, stem[0], ..., stem[n-1], c1, c2).
-    /// Convenience that computes stem commitment from scratch.
     pub fn compute_extension_commitment(stem: &[u8], c1: Commitment, c2: Commitment) -> Commitment {
         let stem_c = Self::compute_stem_commitment(stem);
         Self::compute_extension_commitment_from_stem(stem_c, stem.len(), c1, c2)
@@ -248,32 +265,27 @@ impl EaSNode {
             .unwrap_or(field_zero());
         let new_field = value_to_field(&new_value);
 
-        // Update c1 or c2 homomorphically
-        let old_sub_commitment;
-        let new_sub_commitment;
         if suffix < 128 {
-            old_sub_commitment = self.c1;
+            let old_c1_field = self.c1_field;
             self.c1 = commit_update(self.c1, suffix as usize, old_field, new_field);
-            new_sub_commitment = self.c1;
+            self.c1_field = commitment_to_field(self.c1);
+            self.extension_commitment = commit_update(
+                self.extension_commitment,
+                self.stem.len() + 1,
+                old_c1_field,
+                self.c1_field,
+            );
         } else {
-            old_sub_commitment = self.c2;
+            let old_c2_field = self.c2_field;
             self.c2 = commit_update(self.c2, (suffix - 128) as usize, old_field, new_field);
-            new_sub_commitment = self.c2;
+            self.c2_field = commitment_to_field(self.c2);
+            self.extension_commitment = commit_update(
+                self.extension_commitment,
+                self.stem.len() + 2,
+                old_c2_field,
+                self.c2_field,
+            );
         }
-
-        // Update extension commitment homomorphically
-        // c1 is at index stem.len() + 1, c2 is at index stem.len() + 2
-        let sub_index = if suffix < 128 {
-            self.stem.len() + 1
-        } else {
-            self.stem.len() + 2
-        };
-        self.extension_commitment = commit_update(
-            self.extension_commitment,
-            sub_index,
-            commitment_to_field(old_sub_commitment),
-            commitment_to_field(new_sub_commitment),
-        );
 
         self.values.insert(suffix, new_value);
     }

@@ -45,8 +45,8 @@ fn eas_extension_vector(eas: &EaSNode) -> Vec<Fr> {
     for (i, &byte) in eas.stem.iter().enumerate() {
         v[i + 1] = field_from_byte(byte).0;
     }
-    v[eas.stem.len() + 1] = commitment_to_field(eas.c1).0;
-    v[eas.stem.len() + 2] = commitment_to_field(eas.c2).0;
+    v[eas.stem.len() + 1] = eas.c1_field.0;
+    v[eas.stem.len() + 2] = eas.c2_field.0;
     v
 }
 
@@ -155,7 +155,7 @@ fn traverse_for_key<S: TreeReader>(
                         eas.extension_commitment.0,
                         ext_vec,
                         sub_comm_index,
-                        commitment_to_field(if is_c2 { eas.c2 } else { eas.c1 }).0,
+                        (if is_c2 { eas.c2_field } else { eas.c1_field }).0,
                     ));
 
                     // Open c1/c2 → value
