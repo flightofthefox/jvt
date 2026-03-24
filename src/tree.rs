@@ -12,6 +12,15 @@ pub struct JVT<S> {
     current_version: u64,
 }
 
+impl<S: Clone> Clone for JVT<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            current_version: self.current_version,
+        }
+    }
+}
+
 impl<S: TreeReader + TreeWriter> JVT<S> {
     pub fn new(store: S) -> Self {
         Self {
@@ -32,9 +41,9 @@ impl<S: TreeReader + TreeWriter> JVT<S> {
         match self.store.get_root_key(version) {
             Some(root_key) => match self.store.get_node(root_key) {
                 Some(node) => node.commitment(),
-                None => ZERO_COMMITMENT,
+                None => zero_commitment(),
             },
-            None => ZERO_COMMITMENT,
+            None => zero_commitment(),
         }
     }
 
@@ -557,10 +566,10 @@ mod tests {
     fn commitment_changes_on_insert() {
         let mut tree = JVT::new(MemoryStore::new());
         let c0 = tree.root_commitment();
-        assert_eq!(c0, ZERO_COMMITMENT);
+        assert_eq!(c0, zero_commitment());
 
         let c1 = tree.insert(make_key(1, 0, 0), vec![10]);
-        assert_ne!(c1, ZERO_COMMITMENT);
+        assert_ne!(c1, zero_commitment());
 
         let c2 = tree.insert(make_key(2, 0, 0), vec![20]);
         assert_ne!(c2, c1);

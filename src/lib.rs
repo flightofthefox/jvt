@@ -9,7 +9,7 @@ pub mod proof;
 pub mod storage;
 pub mod tree;
 
-pub use commitment::{Commitment, ZERO_COMMITMENT};
+pub use commitment::{zero_commitment, Commitment};
 pub use node::{Key, NodeKey, Value};
 pub use storage::MemoryStore;
 pub use tree::JVT;

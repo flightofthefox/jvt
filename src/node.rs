@@ -90,7 +90,7 @@ impl InternalNode {
             .children
             .get(&index)
             .map(|c| commitment_to_field(c.commitment))
-            .unwrap_or(FieldElement(0));
+            .unwrap_or(field_zero());
         let new_field = commitment_to_field(new_child.commitment);
 
         self.commitment = commit_update(self.commitment, index as usize, old_field, new_field);
@@ -166,10 +166,10 @@ impl EaSNode {
     pub fn compute_extension_commitment(stem: &[u8], c1: Commitment, c2: Commitment) -> Commitment {
         let mut entries: Vec<(usize, FieldElement)> = Vec::new();
         // Index 0: marker value 1
-        entries.push((0, FieldElement(1)));
+        entries.push((0, field_one()));
         // Indices 1..stem.len(): stem bytes as field elements
         for (i, &byte) in stem.iter().enumerate() {
-            entries.push((i + 1, FieldElement(byte as u128)));
+            entries.push((i + 1, field_from_byte(byte)));
         }
         // c1 and c2 as field elements
         entries.push((stem.len() + 1, commitment_to_field(c1)));
@@ -183,7 +183,7 @@ impl EaSNode {
             .values
             .get(&suffix)
             .map(|v| value_to_field(v))
-            .unwrap_or(FieldElement(0));
+            .unwrap_or(field_zero());
         let new_field = value_to_field(&new_value);
 
         // Update c1 or c2 homomorphically
@@ -293,9 +293,9 @@ mod tests {
         assert_eq!(eas.values.len(), 1);
         assert_eq!(eas.values[&42], vec![100]);
         // c1 should be nonzero (suffix 42 < 128)
-        assert_ne!(eas.c1, ZERO_COMMITMENT);
+        assert_ne!(eas.c1, zero_commitment());
         // c2 should be zero (no values >= 128)
-        assert_eq!(eas.c2, ZERO_COMMITMENT);
+        assert_eq!(eas.c2, zero_commitment());
     }
 
     #[test]
@@ -317,19 +317,24 @@ mod tests {
 
     #[test]
     fn internal_node_update_homomorphic() {
+        // Use real commitments from the commit() function
+        let c_a = commit(vec![(0, value_to_field(&[10]))]);
+        let c_b = commit(vec![(1, value_to_field(&[20]))]);
+        let c_c = commit(vec![(2, value_to_field(&[30]))]);
+
         let mut children = HashMap::new();
         children.insert(
             0,
             Child {
                 version: 1,
-                commitment: Commitment(100),
+                commitment: c_a,
             },
         );
         children.insert(
             5,
             Child {
                 version: 1,
-                commitment: Commitment(200),
+                commitment: c_b,
             },
         );
         let mut node = InternalNode::new(children);
@@ -337,7 +342,7 @@ mod tests {
         // Update child 5
         let new_child = Child {
             version: 2,
-            commitment: Commitment(300),
+            commitment: c_c,
         };
         node.update_child(5, new_child.clone());
 
@@ -347,7 +352,7 @@ mod tests {
             0,
             Child {
                 version: 1,
-                commitment: Commitment(100),
+                commitment: c_a,
             },
         );
         expected_children.insert(5, new_child);

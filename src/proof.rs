@@ -77,14 +77,14 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<
                         // Non-inclusion: empty child slot
                         opening_proofs.push(OpeningProof {
                             index: child_index,
-                            claimed_value: FieldElement(0),
+                            claimed_value: field_zero(),
                         });
                         return Some(VerkleProof {
                             commitments,
                             opening_proofs,
                             eas_stem: vec![],
-                            eas_extension_commitment: ZERO_COMMITMENT,
-                            sub_commitment: ZERO_COMMITMENT,
+                            eas_extension_commitment: zero_commitment(),
+                            sub_commitment: zero_commitment(),
                             is_c2: false,
                             value: None,
                             depth,
@@ -120,7 +120,7 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<
                         opening_proofs,
                         eas_stem: eas.stem.clone(),
                         eas_extension_commitment: eas.extension_commitment,
-                        sub_commitment: ZERO_COMMITMENT,
+                        sub_commitment: zero_commitment(),
                         is_c2: false,
                         value: None,
                         depth,
