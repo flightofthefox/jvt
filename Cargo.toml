@@ -1,0 +1,20 @@
+[package]
+name = "jellyfish-verkle-tree"
+version = "0.1.0"
+edition = "2021"
+description = "Jellyfish Verkle Tree — hybrid JMT + verkle tree authenticated data structure"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1"
+quint-connect = "0.1"
+
+[[bench]]
+name = "comparison"
+harness = false
