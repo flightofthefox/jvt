@@ -45,7 +45,7 @@ impl JvtDriver {
         // Verify get-after-insert for ALL keys
         let root_key = self.store.latest_root_key().unwrap();
         for (k, expected_int) in &self.inserted {
-            let actual = get_value(&self.store, root_key, k);
+            let actual = get_value(&self.store, &root_key, k);
             assert!(actual.is_some(), "Key {:?} not found", &k[..4]);
             let actual_bytes = actual.unwrap();
             let actual_int = i64::from_le_bytes({
@@ -58,7 +58,7 @@ impl JvtDriver {
         }
 
         // Verify commitment consistency
-        assert!(verify_commitment_consistency(&self.store, root_key));
+        assert!(verify_commitment_consistency(&self.store, &root_key));
     }
 }
 

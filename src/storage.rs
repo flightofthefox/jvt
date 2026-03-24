@@ -19,8 +19,8 @@ use crate::node::{Key, Node, NodeKey, StaleNodeIndex, Value};
 
 /// Read-only storage interface.
 pub trait TreeReader {
-    fn get_node(&self, key: &NodeKey) -> Option<&Node>;
-    fn get_root_key(&self, version: u64) -> Option<&NodeKey>;
+    fn get_node(&self, key: &NodeKey) -> Option<Node>;
+    fn get_root_key(&self, version: u64) -> Option<NodeKey>;
 }
 
 /// Write storage interface.
@@ -98,9 +98,9 @@ impl MemoryStore {
         vs
     }
 
-    pub fn latest_root_key(&self) -> Option<&NodeKey> {
+    pub fn latest_root_key(&self) -> Option<NodeKey> {
         let max_version = self.root_keys.keys().max()?;
-        self.root_keys.get(max_version)
+        self.root_keys.get(max_version).cloned()
     }
 
     pub fn latest_version(&self) -> Option<u64> {
@@ -113,12 +113,12 @@ impl MemoryStore {
 // ============================================================
 
 impl TreeReader for MemoryStore {
-    fn get_node(&self, key: &NodeKey) -> Option<&Node> {
-        self.nodes.get(key)
+    fn get_node(&self, key: &NodeKey) -> Option<Node> {
+        self.nodes.get(key).cloned()
     }
 
-    fn get_root_key(&self, version: u64) -> Option<&NodeKey> {
-        self.root_keys.get(&version)
+    fn get_root_key(&self, version: u64) -> Option<NodeKey> {
+        self.root_keys.get(&version).cloned()
     }
 }
 
@@ -164,7 +164,7 @@ fn collect_leaves<S: TreeReader>(
         None => return,
     };
 
-    match node {
+    match &node {
         Node::Internal(internal) => {
             let mut child_indices: Vec<u8> = internal.children.keys().copied().collect();
             child_indices.sort();

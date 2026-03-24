@@ -40,7 +40,7 @@ fn insert(store: &mut MemoryStore, key: Key, value: Value) {
 
 fn get(store: &MemoryStore, key: &Key) -> Option<Value> {
     let root_key = store.latest_root_key()?;
-    get_value(store, root_key, key)
+    get_value(store, &root_key, key)
 }
 
 proptest! {
@@ -67,7 +67,7 @@ proptest! {
             insert(&mut store, *key, value.clone());
         }
         let root = store.latest_root_key().unwrap();
-        prop_assert!(verify_commitment_consistency(&store, root));
+        prop_assert!(verify_commitment_consistency(&store, &root));
     }
 
     #[test]
@@ -110,7 +110,7 @@ proptest! {
 
         for (version, key, expected_value) in &version_snapshots {
             let root_key = store.get_root_key(*version).unwrap();
-            let actual = get_value(&store, root_key, key);
+            let actual = get_value(&store, &root_key, key);
             prop_assert_eq!(actual.as_ref(), Some(expected_value));
         }
     }
@@ -169,7 +169,7 @@ proptest! {
 
         let root_key = store.latest_root_key().unwrap();
         for (key, _value) in &inserted {
-            let proof = jellyfish_verkle_tree::proof::prove(&store, root_key, key);
+            let proof = jellyfish_verkle_tree::proof::prove(&store, &root_key, key);
             prop_assert!(proof.is_some());
             prop_assert!(proof.unwrap().inclusion);
         }

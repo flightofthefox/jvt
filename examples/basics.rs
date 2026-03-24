@@ -30,7 +30,7 @@ fn main() {
     println!("   Root commitment after v1: {:?}", result.root_commitment);
     store.apply(&result);
 
-    let val = get_value(&store, store.latest_root_key().unwrap(), &key_alice);
+    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_alice);
     println!(
         "   get(alice) = {:?}",
         val.as_ref().map(|v| String::from_utf8_lossy(v))
@@ -56,7 +56,7 @@ fn main() {
         ("charlie", key_charlie),
         ("dave", key_dave),
     ] {
-        let val = get_value(&store, store.latest_root_key().unwrap(), &key).unwrap();
+        let val = get_value(&store, &store.latest_root_key().unwrap(), &key).unwrap();
         println!("   get({name}) = {}", String::from_utf8_lossy(&val));
     }
 
@@ -69,7 +69,7 @@ fn main() {
     let result = apply_updates(&store, Some(2), 3, updates);
     store.apply(&result);
 
-    let val = get_value(&store, store.latest_root_key().unwrap(), &key_alice).unwrap();
+    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_alice).unwrap();
     println!(
         "   get(alice) = {} (updated)",
         String::from_utf8_lossy(&val)
@@ -84,7 +84,7 @@ fn main() {
     let result = apply_updates(&store, Some(3), 4, updates);
     store.apply(&result);
 
-    let val = get_value(&store, store.latest_root_key().unwrap(), &key_dave);
+    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_dave);
     println!(
         "   get(dave) = {:?} (expected None)",
         val.as_ref().map(|v| String::from_utf8_lossy(v))
@@ -94,13 +94,13 @@ fn main() {
     println!("\n5. Non-existent key");
 
     let key_eve = make_key(b"eve");
-    let val = get_value(&store, store.latest_root_key().unwrap(), &key_eve);
+    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_eve);
     println!("   get(eve) = {:?} (never inserted)", val);
 
     // ── 6. Verify tree integrity ────────────────────────────────
     println!("\n6. Commitment consistency check");
 
-    let ok = verify_commitment_consistency(&store, store.latest_root_key().unwrap());
+    let ok = verify_commitment_consistency(&store, &store.latest_root_key().unwrap());
     println!("   All commitments consistent: {ok}");
 
     // ── Summary ─────────────────────────────────────────────────

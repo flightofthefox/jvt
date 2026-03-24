@@ -65,7 +65,7 @@ fn main() {
         let mut depths = Vec::new();
 
         for key in &sample_keys {
-            if let Some(p) = proof::prove(&store, root_key, key) {
+            if let Some(p) = proof::prove(&store, &root_key, key) {
                 depths.push(p.commitments.len());
             }
         }

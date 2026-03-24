@@ -102,7 +102,7 @@ fn traverse_for_key<S: TreeReader>(
         match node {
             Node::Internal(internal) => {
                 let child_index = key[depth];
-                let a = internal_node_vector(internal);
+                let a = internal_node_vector(&internal);
                 let claimed_value = a[child_index as usize];
 
                 openings.push((
@@ -137,7 +137,7 @@ fn traverse_for_key<S: TreeReader>(
                     let is_c2 = suffix >= 128;
 
                     // Open the marker byte (index 0) to prove this is an EaS, not an internal node
-                    let ext_vec = eas_extension_vector(eas);
+                    let ext_vec = eas_extension_vector(&eas);
                     openings.push((
                         eas.extension_commitment.0,
                         ext_vec.clone(),
@@ -159,7 +159,7 @@ fn traverse_for_key<S: TreeReader>(
                     ));
 
                     // Open c1/c2 → value
-                    let sub_vec = eas_sub_commitment_vector(eas, is_c2);
+                    let sub_vec = eas_sub_commitment_vector(&eas, is_c2);
                     let sub_commitment = if is_c2 { eas.c2 } else { eas.c1 };
                     let sub_index = if is_c2 {
                         (suffix - 128) as usize
@@ -188,7 +188,7 @@ fn traverse_for_key<S: TreeReader>(
                         .unwrap_or(eas.stem.len().min(expected_stem.len()));
 
                     // Open marker byte to prove this is an EaS, not an internal node
-                    let ext_vec = eas_extension_vector(eas);
+                    let ext_vec = eas_extension_vector(&eas);
                     openings.push((
                         eas.extension_commitment.0,
                         ext_vec.clone(),
@@ -557,7 +557,7 @@ mod tests {
         insert(&mut store, key, value.clone());
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove_single(&store, rk, &key).unwrap();
+        let proof = prove_single(&store, &rk, &key).unwrap();
 
         // marker + extension→c1 + c1→value = 3 openings
         assert_eq!(proof.key_data[0].query_path.len(), 3);
@@ -573,10 +573,10 @@ mod tests {
         let rk = store.latest_root_key().unwrap();
         let rc = root_c(&store);
 
-        let p1 = prove_single(&store, rk, &make_key(1, 0, 0)).unwrap();
+        let p1 = prove_single(&store, &rk, &make_key(1, 0, 0)).unwrap();
         assert!(verify_single(&p1, rc, &make_key(1, 0, 0), Some(&vec![10])));
 
-        let p2 = prove_single(&store, rk, &make_key(2, 0, 0)).unwrap();
+        let p2 = prove_single(&store, &rk, &make_key(2, 0, 0)).unwrap();
         assert!(verify_single(&p2, rc, &make_key(2, 0, 0), Some(&vec![20])));
     }
 
@@ -587,7 +587,7 @@ mod tests {
 
         let rk = store.latest_root_key().unwrap();
         let key2 = make_key(5, 6, 7);
-        let proof = prove_single(&store, rk, &key2).unwrap();
+        let proof = prove_single(&store, &rk, &key2).unwrap();
 
         assert!(matches!(
             proof.key_data[0].termination,
@@ -605,7 +605,7 @@ mod tests {
         let rk = store.latest_root_key().unwrap();
         // Key with first byte 3 — not in the tree, hits empty child slot
         let key3 = make_key(3, 0, 0);
-        let proof = prove_single(&store, rk, &key3).unwrap();
+        let proof = prove_single(&store, &rk, &key3).unwrap();
 
         assert!(matches!(
             proof.key_data[0].termination,
@@ -622,7 +622,7 @@ mod tests {
 
         let rk = store.latest_root_key().unwrap();
         let keys = [make_key(1, 0, 0), make_key(2, 0, 0)];
-        let proof = prove(&store, rk, &keys).unwrap();
+        let proof = prove(&store, &rk, &keys).unwrap();
 
         assert_eq!(proof.proof_byte_size(), 576);
         assert!(verify(
@@ -645,7 +645,7 @@ mod tests {
         }
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove(&store, rk, &keys).unwrap();
+        let proof = prove(&store, &rk, &keys).unwrap();
         assert_eq!(proof.proof_byte_size(), 576);
 
         let expected: Vec<Option<Value>> = values.into_iter().map(Some).collect();
@@ -660,7 +660,7 @@ mod tests {
 
         let rk = store.latest_root_key().unwrap();
         let keys = [make_key(1, 0, 0), make_key(2, 0, 0)];
-        let proof = prove(&store, rk, &keys).unwrap();
+        let proof = prove(&store, &rk, &keys).unwrap();
 
         assert!(!verify(
             &proof,
@@ -679,7 +679,7 @@ mod tests {
 
         let rk = store.latest_root_key().unwrap();
         let keys = [make_key(5, 1, 0), make_key(5, 2, 0), make_key(6, 0, 0)];
-        let proof = prove(&store, rk, &keys).unwrap();
+        let proof = prove(&store, &rk, &keys).unwrap();
 
         assert!(verify(
             &proof,
@@ -698,7 +698,7 @@ mod tests {
         let rk = store.latest_root_key().unwrap();
         let key3 = make_key(1, 99, 0);
         let keys = [make_key(1, 0, 0), key3];
-        let proof = prove(&store, rk, &keys).unwrap();
+        let proof = prove(&store, &rk, &keys).unwrap();
 
         assert!(verify(
             &proof,
@@ -715,7 +715,7 @@ mod tests {
         insert(&mut store, make_key(2, 0, 0), vec![20]);
 
         let rk = store.latest_root_key().unwrap();
-        let proof = prove_single(&store, rk, &make_key(1, 0, 0)).unwrap();
+        let proof = prove_single(&store, &rk, &make_key(1, 0, 0)).unwrap();
 
         insert(&mut store, make_key(3, 0, 0), vec![30]);
         let new_root = root_c(&store);

@@ -73,7 +73,7 @@ fn main() {
 
     fn read_balance(store: &MemoryStore, version: u64, key: &Key) -> Option<u64> {
         let root_key = store.get_root_key(version)?;
-        get_value(store, root_key, key).map(|v| {
+        get_value(store, &root_key, key).map(|v| {
             let mut buf = [0u8; 8];
             buf[..v.len().min(8)].copy_from_slice(&v[..v.len().min(8)]);
             u64::from_le_bytes(buf)
@@ -112,7 +112,7 @@ fn main() {
     println!("\n── Consistency checks ───────────────────────────────");
     for v in 1..=5 {
         let root_key = store.get_root_key(v).unwrap();
-        let ok = verify_commitment_consistency(&store, root_key);
+        let ok = verify_commitment_consistency(&store, &root_key);
         println!("  v{v}: consistent = {ok}");
     }
 
@@ -140,6 +140,6 @@ fn main() {
     println!("\nPost-prune v5 reads: A={bal_a}, C={bal_c}");
     println!(
         "Post-prune v5 consistent: {}",
-        verify_commitment_consistency(&store, store.latest_root_key().unwrap())
+        verify_commitment_consistency(&store, &store.latest_root_key().unwrap())
     );
 }

@@ -250,7 +250,7 @@ mod tests {
         insert(&mut store, key, value.clone());
 
         let root_key = store.latest_root_key().unwrap();
-        let proof = prove(&store, root_key, &key).unwrap();
+        let proof = prove(&store, &root_key, &key).unwrap();
 
         assert!(proof.inclusion);
         assert_eq!(proof.value, Some(value));
@@ -263,7 +263,7 @@ mod tests {
 
         let key2 = make_key(5, 6, 7);
         let root_key = store.latest_root_key().unwrap();
-        let proof = prove(&store, root_key, &key2).unwrap();
+        let proof = prove(&store, &root_key, &key2).unwrap();
 
         assert!(!proof.inclusion);
         assert_eq!(proof.value, None);
@@ -277,11 +277,11 @@ mod tests {
 
         let root_key = store.latest_root_key().unwrap();
 
-        let proof1 = prove(&store, root_key, &make_key(1, 0, 0)).unwrap();
+        let proof1 = prove(&store, &root_key, &make_key(1, 0, 0)).unwrap();
         assert!(proof1.inclusion);
         assert_eq!(proof1.value, Some(vec![10]));
 
-        let proof2 = prove(&store, root_key, &make_key(2, 0, 0)).unwrap();
+        let proof2 = prove(&store, &root_key, &make_key(2, 0, 0)).unwrap();
         assert!(proof2.inclusion);
         assert_eq!(proof2.value, Some(vec![20]));
     }
@@ -299,7 +299,7 @@ mod tests {
         let root_key = store.latest_root_key().unwrap();
         let root_c = root_commitment_at(&store, store.latest_version().unwrap());
 
-        let batch_proof = prove_batch(&store, root_key, &keys).unwrap();
+        let batch_proof = prove_batch(&store, &root_key, &keys).unwrap();
         let expected_values: Vec<Option<Value>> = values.into_iter().map(Some).collect();
 
         assert!(verify_batch(&batch_proof, root_c, &keys, &expected_values));

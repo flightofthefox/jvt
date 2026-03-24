@@ -111,7 +111,7 @@ fn main() {
     println!("\nAlice's balance over time:");
     for block in 1..=4 {
         let root_key = store.get_root_key(block).unwrap();
-        let bal = get_value(&store, root_key, &account_key(ALICE, BALANCE))
+        let bal = get_value(&store, &root_key, &account_key(ALICE, BALANCE))
             .map(|v| decode_u64(&v))
             .unwrap();
         println!("  Block {block}: {bal}");
@@ -120,7 +120,7 @@ fn main() {
     println!("\nBob's balance over time:");
     for block in 1..=4 {
         let root_key = store.get_root_key(block).unwrap();
-        let bal = get_value(&store, root_key, &account_key(BOB, BALANCE))
+        let bal = get_value(&store, &root_key, &account_key(BOB, BALANCE))
             .map(|v| decode_u64(&v))
             .unwrap();
         println!("  Block {block}: {bal}");
@@ -129,7 +129,7 @@ fn main() {
     println!("\nTotal supply over time:");
     for block in 1..=4 {
         let root_key = store.get_root_key(block).unwrap();
-        let supply = get_value(&store, root_key, &account_key(CONTRACT, TOTAL_SUPPLY))
+        let supply = get_value(&store, &root_key, &account_key(CONTRACT, TOTAL_SUPPLY))
             .map(|v| decode_u64(&v))
             .unwrap();
         println!("  Block {block}: {supply}");
@@ -142,9 +142,9 @@ fn main() {
     let root_key = store.get_root_key(4).unwrap();
     let block4_root = root_commitment_at(&store, 4);
     let key = account_key(ALICE, BALANCE);
-    let value = get_value(&store, root_key, &key);
+    let value = get_value(&store, &root_key, &key);
 
-    let proof = verkle_proof::prove_single(&store, root_key, &key).unwrap();
+    let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
     println!("  Claimed value: {}", decode_u64(value.as_ref().unwrap()));
     println!("  Proof size: {} bytes", proof.proof_byte_size());
 
@@ -159,9 +159,9 @@ fn main() {
     ];
     let values: Vec<Option<Vec<u8>>> = keys
         .iter()
-        .map(|k| get_value(&store, root_key, k))
+        .map(|k| get_value(&store, &root_key, k))
         .collect();
-    let proof = verkle_proof::prove(&store, root_key, &keys).unwrap();
+    let proof = verkle_proof::prove(&store, &root_key, &keys).unwrap();
     let valid = verkle_proof::verify(&proof, block4_root, &keys, &values);
     println!(
         "  Proof size: {} bytes (same constant!)",
@@ -187,6 +187,6 @@ fn main() {
     );
 
     // Latest state is still intact
-    let ok = verify_commitment_consistency(&store, store.latest_root_key().unwrap());
+    let ok = verify_commitment_consistency(&store, &store.latest_root_key().unwrap());
     println!("Block 4 still consistent: {ok}");
 }

@@ -45,8 +45,7 @@ pub fn apply_updates<S: TreeReader>(
     // Resolve the parent root — only set current_root_key if the node actually exists
     let mut current_root_key: Option<NodeKey> = parent_version
         .and_then(|v| store.get_root_key(v))
-        .filter(|rk| store.get_node(rk).is_some())
-        .cloned();
+        .filter(|rk| store.get_node(rk).is_some());
     let mut batch = TreeUpdateBatch::default();
 
     for (key, value) in updates {
@@ -147,7 +146,7 @@ pub fn apply_updates<S: TreeReader>(
 /// Get a value from the tree.
 pub fn get_value<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<Value> {
     let root_node = store.get_node(root_key)?;
-    get_recursive(root_node, store, key, 0)
+    get_recursive(&root_node, store, key, 0)
 }
 
 /// Verify that all commitments in the tree are consistent (recompute from
@@ -159,7 +158,7 @@ pub fn verify_commitment_consistency<S: TreeReader>(store: &S, root_key: &NodeKe
 /// Get the root commitment for a given version.
 pub fn root_commitment_at<S: TreeReader>(store: &S, version: u64) -> Commitment {
     match store.get_root_key(version) {
-        Some(root_key) => match store.get_node(root_key) {
+        Some(ref root_key) => match store.get_node(root_key) {
             Some(node) => node.commitment(),
             None => zero_commitment(),
         },
@@ -191,11 +190,14 @@ impl<'a, S: TreeReader> OverlayStore<'a, S> {
 }
 
 impl<S: TreeReader> TreeReader for OverlayStore<'_, S> {
-    fn get_node(&self, key: &NodeKey) -> Option<&Node> {
-        self.overlay.get(key).or_else(|| self.base.get_node(key))
+    fn get_node(&self, key: &NodeKey) -> Option<Node> {
+        self.overlay
+            .get(key)
+            .cloned()
+            .or_else(|| self.base.get_node(key))
     }
 
-    fn get_root_key(&self, version: u64) -> Option<&NodeKey> {
+    fn get_root_key(&self, version: u64) -> Option<NodeKey> {
         self.base.get_root_key(version)
     }
 }
@@ -220,7 +222,7 @@ fn get_recursive<S: TreeReader>(node: &Node, store: &S, key: &Key, depth: usize)
             let child_path: Vec<u8> = key[..depth + 1].to_vec();
             let child_key = NodeKey::new(child.version, child_path);
             let child_node = store.get_node(&child_key)?;
-            get_recursive(child_node, store, key, depth + 1)
+            get_recursive(&child_node, store, key, depth + 1)
         }
     }
 }
@@ -231,7 +233,7 @@ fn verify_node_commitment<S: TreeReader>(store: &S, node_key: &NodeKey) -> bool 
         None => return true,
     };
 
-    match node {
+    match &node {
         Node::Internal(n) => {
             let recomputed = InternalNode::compute_commitment(&n.children);
             if n.commitment != recomputed {
@@ -285,7 +287,7 @@ fn insert_single<S: TreeReader>(
     depth: usize,
     version: u64,
 ) -> InsertResult {
-    let current_node = store.get_node(current_key).cloned().unwrap_or_else(|| {
+    let current_node = store.get_node(current_key).unwrap_or_else(|| {
         panic!(
             "node not found for key {:?} at depth {}",
             current_key, depth
@@ -546,7 +548,7 @@ fn delete_single<S: TreeReader>(
     version: u64,
 ) -> MutationResult {
     let current_node = match store.get_node(current_key) {
-        Some(n) => n.clone(),
+        Some(n) => n,
         None => return MutationResult::Unchanged,
     };
 
@@ -644,8 +646,7 @@ fn delete_single<S: TreeReader>(
                             // with a longer stem (prepend the remaining_idx byte)
                             let mut new_stem = vec![remaining_idx];
                             new_stem.extend_from_slice(&remaining_eas.stem);
-                            let collapsed =
-                                EaSNode::from_values(new_stem, remaining_eas.values.clone());
+                            let collapsed = EaSNode::from_values(new_stem, remaining_eas.values);
                             let collapsed_key = NodeKey::new(version, key[..depth].to_vec());
                             let commitment = collapsed.commitment();
                             stale_batch.put_node(collapsed_key.clone(), Node::EaS(collapsed));
@@ -729,7 +730,7 @@ mod tests {
     /// Helper: get a value at the latest version.
     fn get(store: &MemoryStore, key: &Key) -> Option<Value> {
         let root_key = store.latest_root_key()?;
-        get_value(store, root_key, key)
+        get_value(store, &root_key, key)
     }
 
     #[test]
@@ -807,7 +808,7 @@ mod tests {
         insert(&mut store, make_key(1, 0, 1), vec![40]);
 
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     #[test]
@@ -836,7 +837,7 @@ mod tests {
         assert_eq!(get(&store, &make_key(2, 0, 0)), Some(vec![20]));
         assert_eq!(get(&store, &make_key(3, 0, 0)), Some(vec![30]));
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     #[test]
@@ -850,7 +851,7 @@ mod tests {
             );
         }
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
 
         for i in 0u8..50 {
             let key = make_key(i, i.wrapping_mul(7), i.wrapping_mul(13));
@@ -874,7 +875,7 @@ mod tests {
         assert_eq!(get(&store, &make_key(2, 0, 0)), Some(vec![20]));
         assert_eq!(get(&store, &make_key(3, 0, 0)), Some(vec![30]));
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     #[test]
@@ -892,7 +893,7 @@ mod tests {
             assert_eq!(get(&store, &key), Some(vec![i]));
         }
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     // --- Delete tests ---
@@ -932,7 +933,7 @@ mod tests {
         assert_eq!(get(&store, &key2), Some(vec![20]));
 
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     #[test]
@@ -950,10 +951,10 @@ mod tests {
         // key2 should still work
         assert_eq!(get(&store, &key2), Some(vec![20]));
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
 
         // The root should be an EaS now (collapsed), not an internal node
-        let root_node = store.get_node(root).unwrap();
+        let root_node = store.get_node(&root).unwrap();
         assert!(matches!(root_node, Node::EaS(_)));
     }
 
@@ -988,7 +989,7 @@ mod tests {
         assert_eq!(get(&store, &key1), None);
         assert_eq!(get(&store, &key2), Some(vec![200]));
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     #[test]
@@ -1019,7 +1020,7 @@ mod tests {
         assert_eq!(get(&store, &key), Some(vec![20]));
 
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     #[test]
@@ -1045,7 +1046,7 @@ mod tests {
         assert_eq!(get(&store, &make_key(4, 0, 0)), Some(vec![40]));
 
         let root = store.latest_root_key().unwrap();
-        assert!(verify_commitment_consistency(&store, root));
+        assert!(verify_commitment_consistency(&store, &root));
     }
 
     // --- Iterator tests ---
@@ -1060,7 +1061,7 @@ mod tests {
         insert(&mut store, make_key(2, 0, 0), vec![20]);
 
         let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
 
         // Should be sorted lexicographically by key
         assert_eq!(leaves.len(), 3);
@@ -1085,7 +1086,7 @@ mod tests {
 
         // From key 5 onwards
         let from = make_key(5, 0, 0);
-        let leaves: Vec<_> = store.iter_leaves(root, Some(&from)).collect();
+        let leaves: Vec<_> = store.iter_leaves(&root, Some(&from)).collect();
 
         assert_eq!(leaves.len(), 5); // keys 5, 6, 7, 8, 9
         assert_eq!(leaves[0].0[0], 5);
@@ -1106,7 +1107,7 @@ mod tests {
         }
 
         let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
 
         // Deduplicated (suffix 1 inserted twice) and sorted by suffix
         let suffixes: Vec<u8> = leaves.iter().map(|(k, _)| k[31]).collect();
@@ -1122,7 +1123,7 @@ mod tests {
         delete(&mut store, make_key(1, 0, 0));
 
         let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
         assert_eq!(leaves.len(), 0);
     }
 
@@ -1138,7 +1139,7 @@ mod tests {
         delete(&mut store, make_key(3, 0, 0));
 
         let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
 
         assert_eq!(leaves.len(), 3);
         assert_eq!(leaves[0].0[0], 0);

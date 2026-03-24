@@ -54,7 +54,7 @@ fn reject_wrong_value_single_key() {
     let store = build_store(5);
     let rk = store.latest_root_key().unwrap();
     let key = make_key(0, 0, 0);
-    let proof = verkle_proof::prove_single(&store, rk, &key).unwrap();
+    let proof = verkle_proof::prove_single(&store, &rk, &key).unwrap();
 
     // Correct value verifies
     assert!(verkle_proof::verify_single(
@@ -86,7 +86,7 @@ fn reject_proof_against_wrong_root() {
     let mut store = build_store(5);
     let rk = store.latest_root_key().unwrap();
     let key = make_key(0, 0, 0);
-    let proof = verkle_proof::prove_single(&store, rk, &key).unwrap();
+    let proof = verkle_proof::prove_single(&store, &rk, &key).unwrap();
 
     // Insert more keys to change the root
     insert(&mut store, make_key(50, 0, 0), vec![50]);
@@ -108,7 +108,7 @@ fn reject_proof_for_wrong_key() {
     let key_a = make_key(0, 0, 0);
     let key_b = make_key(1, 7, 13);
 
-    let proof_a = verkle_proof::prove_single(&store, rk, &key_a).unwrap();
+    let proof_a = verkle_proof::prove_single(&store, &rk, &key_a).unwrap();
 
     // Proof for key_a should not verify for key_b
     assert!(!verkle_proof::verify_single(
@@ -127,7 +127,7 @@ fn reject_batch_with_one_wrong_value() {
         .map(|i| make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)))
         .collect();
 
-    let proof = verkle_proof::prove(&store, rk, &keys).unwrap();
+    let proof = verkle_proof::prove(&store, &rk, &keys).unwrap();
 
     // All correct
     let correct: Vec<Option<Value>> = (0..5u8).map(|i| Some(vec![i])).collect();
@@ -152,7 +152,7 @@ fn reject_batch_with_extra_key() {
         .map(|i| make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)))
         .collect();
 
-    let proof = verkle_proof::prove(&store, rk, &keys).unwrap();
+    let proof = verkle_proof::prove(&store, &rk, &keys).unwrap();
 
     // Verify with extra key should fail (length mismatch)
     let mut more_keys = keys.clone();
@@ -172,7 +172,7 @@ fn reject_inclusion_for_absent_key() {
     let rk = store.latest_root_key().unwrap();
     let absent_key = make_key(99, 99, 99);
 
-    let proof = verkle_proof::prove_single(&store, rk, &absent_key).unwrap();
+    let proof = verkle_proof::prove_single(&store, &rk, &absent_key).unwrap();
 
     // Claiming a value exists when it doesn't should fail
     assert!(!verkle_proof::verify_single(
@@ -201,7 +201,7 @@ fn single_key_tree() {
     insert(&mut store, make_key(42, 0, 0), vec![100]);
 
     let rk = store.latest_root_key().unwrap();
-    let proof = verkle_proof::prove_single(&store, rk, &make_key(42, 0, 0)).unwrap();
+    let proof = verkle_proof::prove_single(&store, &rk, &make_key(42, 0, 0)).unwrap();
 
     // Root is an EaS — no internal nodes, but EaS openings exist
     // (marker byte, extension → c1/c2, c1/c2 → value)
@@ -222,7 +222,7 @@ fn zero_value() {
 
     let rk = store.latest_root_key().unwrap();
 
-    let p1 = verkle_proof::prove_single(&store, rk, &make_key(1, 0, 0)).unwrap();
+    let p1 = verkle_proof::prove_single(&store, &rk, &make_key(1, 0, 0)).unwrap();
     assert!(verkle_proof::verify_single(
         &p1,
         root_c(&store),
@@ -230,7 +230,7 @@ fn zero_value() {
         Some(&vec![0])
     ));
 
-    let p2 = verkle_proof::prove_single(&store, rk, &make_key(2, 0, 0)).unwrap();
+    let p2 = verkle_proof::prove_single(&store, &rk, &make_key(2, 0, 0)).unwrap();
     assert!(verkle_proof::verify_single(
         &p2,
         root_c(&store),
@@ -257,7 +257,7 @@ fn same_stem_different_suffixes() {
         let mut key = [0u8; 32];
         key[0] = 1;
         key[31] = suffix;
-        assert_eq!(get_value(&store, rk, &key), Some(vec![suffix]));
+        assert_eq!(get_value(&store, &rk, &key), Some(vec![suffix]));
     }
 
     // Batch proof for all of them
@@ -270,7 +270,7 @@ fn same_stem_different_suffixes() {
         })
         .collect();
 
-    let proof = verkle_proof::prove(&store, rk, &keys).unwrap();
+    let proof = verkle_proof::prove(&store, &rk, &keys).unwrap();
     let expected: Vec<Option<Value>> = (0..10u8).map(|s| Some(vec![s])).collect();
     assert!(verkle_proof::verify(
         &proof,
@@ -289,7 +289,7 @@ fn large_batch() {
         .map(|i| make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)))
         .collect();
 
-    let proof = verkle_proof::prove(&store, rk, &keys).unwrap();
+    let proof = verkle_proof::prove(&store, &rk, &keys).unwrap();
     assert_eq!(proof.proof_byte_size(), 576); // still constant
 
     let expected: Vec<Option<Value>> = (0..50u8).map(|i| Some(vec![i])).collect();
@@ -319,12 +319,12 @@ fn commitment_consistency_after_many_operations() {
     }
 
     let rk = store.latest_root_key().unwrap();
-    assert!(verify_commitment_consistency(&store, rk));
+    assert!(verify_commitment_consistency(&store, &rk));
 
     // Verify updated values
-    assert_eq!(get_value(&store, rk, &make_key(5, 0, 0)), Some(vec![105]));
-    assert_eq!(get_value(&store, rk, &make_key(15, 0, 0)), Some(vec![15]));
-    assert_eq!(get_value(&store, rk, &make_key(0, 5, 0)), Some(vec![205]));
+    assert_eq!(get_value(&store, &rk, &make_key(5, 0, 0)), Some(vec![105]));
+    assert_eq!(get_value(&store, &rk, &make_key(15, 0, 0)), Some(vec![15]));
+    assert_eq!(get_value(&store, &rk, &make_key(0, 5, 0)), Some(vec![205]));
 }
 
 #[test]

@@ -42,8 +42,8 @@ fn main() {
     println!("1. Single-key inclusion proof");
 
     let key = entries[0].0;
-    let proof = verkle_proof::prove_single(&store, root_key, &key).unwrap();
-    let value = get_value(&store, root_key, &key);
+    let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
+    let value = get_value(&store, &root_key, &key);
 
     println!("   Key:   0x{}", hex(&key[..3]));
     println!(
@@ -63,7 +63,7 @@ fn main() {
     println!("\n2. Single-key non-inclusion proof (key never inserted)");
 
     let missing_key = make_key(&[0xDE, 0xAD, 0xBE, 0xEF]);
-    let proof = verkle_proof::prove_single(&store, root_key, &missing_key).unwrap();
+    let proof = verkle_proof::prove_single(&store, &root_key, &missing_key).unwrap();
 
     println!("   Key:   0x{}", hex(&missing_key[..4]));
     println!("   Value: None (absent)");
@@ -88,10 +88,10 @@ fn main() {
         let keys: Vec<Key> = entries.iter().take(count).map(|(k, _)| *k).collect();
         let values: Vec<Option<Vec<u8>>> = keys
             .iter()
-            .map(|k| get_value(&store, root_key, k))
+            .map(|k| get_value(&store, &root_key, k))
             .collect();
 
-        let proof = verkle_proof::prove(&store, root_key, &keys).unwrap();
+        let proof = verkle_proof::prove(&store, &root_key, &keys).unwrap();
         let valid = verkle_proof::verify(&proof, root_commitment, &keys, &values);
 
         println!(
@@ -109,7 +109,7 @@ fn main() {
     let keys = vec![present_key, absent_key];
     let values: Vec<Option<Vec<u8>>> = keys
         .iter()
-        .map(|k| get_value(&store, root_key, k))
+        .map(|k| get_value(&store, &root_key, k))
         .collect();
 
     println!(
@@ -121,7 +121,7 @@ fn main() {
     );
     println!("   Key 0x{}: {:?}", hex(&absent_key[..2]), values[1]);
 
-    let proof = verkle_proof::prove(&store, root_key, &keys).unwrap();
+    let proof = verkle_proof::prove(&store, &root_key, &keys).unwrap();
     let valid = verkle_proof::verify(&proof, root_commitment, &keys, &values);
     println!(
         "   Proof size: {} bytes (core), valid: {valid}",
@@ -138,8 +138,8 @@ fn main() {
     let wrong_root = result2.root_commitment;
 
     let key = entries[0].0;
-    let proof = verkle_proof::prove_single(&store, root_key, &key).unwrap();
-    let value = get_value(&store, root_key, &key);
+    let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
+    let value = get_value(&store, &root_key, &key);
 
     let valid_right = verkle_proof::verify_single(&proof, root_commitment, &key, value.as_ref());
     let valid_wrong = verkle_proof::verify_single(&proof, wrong_root, &key, value.as_ref());
