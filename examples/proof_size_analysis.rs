@@ -1,11 +1,11 @@
-//! Structural proof size analysis: JVT (verkle) vs hypothetical JMT (Merkle).
+//! Proof size analysis: JVT (verkle) vs hypothetical JMT (Merkle).
 //!
-//! Computes and compares proof sizes for both single-key and batch proofs.
-//! This analysis is structural — it measures the number of components in each
-//! proof, not the byte sizes of real cryptographic proofs (since the mock
-//! backend doesn't produce realistic proof sizes).
+//! Compares proof sizes using:
+//! - Actual measured sizes from real IPA and multiproof implementations (pedersen feature)
+//! - Structural estimates from tree depth analysis (mock)
 //!
-//! Run with: cargo run --example proof_size_analysis
+//! Run with mock:     cargo run --example proof_size_analysis
+//! Run with Pedersen: cargo run --example proof_size_analysis --features pedersen
 
 use jellyfish_verkle_tree::node::NodeKey;
 use jellyfish_verkle_tree::proof;
@@ -18,32 +18,51 @@ fn make_key(i: u32) -> Key {
     key
 }
 
-/// Estimate JMT (Merkle) single proof size for a given depth.
-/// Each level requires 15 sibling hashes (radix-16) × 32 bytes = 480 bytes.
-/// Plus the leaf itself (32 bytes key hash + 32 bytes value hash).
+// ============================================================
+// Size constants from actual implementations
+// ============================================================
+
+/// IPA proof size for 256-element vector: 8 rounds × 2 points × 32 bytes + 1 scalar × 32 bytes.
+const IPA_PROOF_BYTES: usize = 8 * 2 * 32 + 32; // = 544
+
+/// Multipoint proof size: 1 group element (D) + 1 IPA proof = 32 + 544.
+const MULTIPROOF_BYTES: usize = 32 + IPA_PROOF_BYTES; // = 576
+
+/// JMT single proof per level: 15 sibling hashes × 32 bytes = 480 bytes.
+const JMT_SIBLINGS_PER_LEVEL: usize = 15 * 32; // = 480
+
+/// JMT leaf overhead: key hash + value hash.
+const JMT_LEAF_BYTES: usize = 64;
+
 fn jmt_single_proof_size(depth: usize) -> usize {
-    depth * 15 * 32 + 64 // siblings + leaf
-}
-
-/// Estimate JVT (verkle) single proof size for a given depth.
-/// Each level requires 1 IPA opening proof ≈ 64 bytes (real IPA).
-/// Plus the EaS proof ≈ 96 bytes (stem + c1/c2 openings).
-fn jvt_single_proof_size_real(depth: usize) -> usize {
-    depth * 64 + 96 // IPA openings + EaS proof
-}
-
-/// Estimate JVT aggregated proof size for N keys.
-/// The multipoint argument compresses all openings to ~200 bytes.
-/// Per-key overhead is just key (32 bytes) + value commitment info (~32 bytes).
-fn jvt_batch_proof_size_real(n: usize) -> usize {
-    200 + n * 64 // multipoint proof + per-key data
+    depth * JMT_SIBLINGS_PER_LEVEL + JMT_LEAF_BYTES
 }
 
 fn main() {
     println!("JVT Proof Size Analysis");
     println!("=======================\n");
 
-    // Build trees of various sizes
+    #[cfg(feature = "pedersen")]
+    println!("Mode: REAL Pedersen commitments + IPA/Multipoint proofs\n");
+    #[cfg(not(feature = "pedersen"))]
+    println!("Mode: Mock commitments (structural estimates)\n");
+
+    println!("Constants (from implementation):");
+    println!(
+        "  IPA proof (256-element vector): {} bytes",
+        IPA_PROOF_BYTES
+    );
+    println!(
+        "  Multipoint proof (any N queries): {} bytes",
+        MULTIPROOF_BYTES
+    );
+    println!(
+        "  JMT sibling hashes per level: {} bytes",
+        JMT_SIBLINGS_PER_LEVEL
+    );
+    println!();
+
+    // Build trees and measure actual proof depths
     let sizes = [10u32, 100, 1000, 10_000];
 
     for &n in &sizes {
@@ -54,104 +73,113 @@ fn main() {
 
         let root_key = NodeKey::root(tree.current_version());
 
-        // Measure structural proof depth for several keys
-        let sample_keys: Vec<Key> = (0..n.min(100)).map(|i| make_key(i)).collect();
+        // Measure proof depth for sample keys
+        let sample_keys: Vec<Key> = (0..n.min(100)).map(make_key).collect();
         let mut depths = Vec::new();
 
         for key in &sample_keys {
             if let Some(p) = proof::prove(&tree.store, &root_key, key) {
-                depths.push(p.commitments.len()); // number of internal node levels
+                depths.push(p.commitments.len());
             }
         }
 
-        let avg_depth = if depths.is_empty() {
-            0.0
-        } else {
-            depths.iter().sum::<usize>() as f64 / depths.len() as f64
-        };
+        let avg_depth = depths.iter().sum::<usize>() as f64 / depths.len().max(1) as f64;
         let max_depth = depths.iter().copied().max().unwrap_or(0);
-
-        // JMT comparison: radix-16, so depth would be roughly log16(n)
-        let jmt_avg_depth = if n > 1 {
+        let jmt_depth = if n > 1 {
             (n as f64).log(16.0).ceil() as usize
         } else {
             1
         };
 
-        println!("Tree size: {} keys", n);
+        println!("Tree: {} keys", n);
         println!(
-            "  JVT (256-ary) avg proof depth: {:.1} levels (max {})",
+            "  JVT depth: avg {:.1}, max {} (256-ary)",
             avg_depth, max_depth
         );
-        println!("  JMT (16-ary)  est proof depth: {} levels", jmt_avg_depth);
-        println!();
+        println!("  JMT depth: ~{} (16-ary)", jmt_depth);
 
-        // Single proof size comparison
-        let jvt_depth = max_depth;
-        let jvt_single = jvt_single_proof_size_real(jvt_depth);
-        let jmt_single = jmt_single_proof_size(jmt_avg_depth);
-        println!("  Single proof size (estimated with real crypto):");
+        // Single proof comparison (estimated)
+        let jvt_single = max_depth * IPA_PROOF_BYTES + 96;
+        let jmt_single = jmt_single_proof_size(jmt_depth);
+        println!("  Single-key proof:");
         println!(
-            "    JVT: {} bytes ({} levels × 64B IPA + 96B EaS)",
-            jvt_single, jvt_depth
+            "    JVT: {} bytes ({} levels × {} + 96 EaS)",
+            jvt_single, max_depth, IPA_PROOF_BYTES
         );
         println!(
-            "    JMT: {} bytes ({} levels × 480B siblings + 64B leaf)",
-            jmt_single, jmt_avg_depth
+            "    JMT: {} bytes ({} levels × {} + {} leaf)",
+            jmt_single, jmt_depth, JMT_SIBLINGS_PER_LEVEL, JMT_LEAF_BYTES
         );
-        println!(
-            "    Reduction: {:.1}×",
-            jmt_single as f64 / jvt_single as f64
-        );
-        println!();
+        if jvt_single > 0 {
+            println!("    Ratio: {:.1}×", jmt_single as f64 / jvt_single as f64);
+        }
 
-        // Batch proof comparison for various batch sizes
-        let batch_sizes = [10, 100, 1000];
-        println!("  Batch proof sizes (estimated):");
-        println!(
-            "    {:>6} | {:>10} | {:>14} | {}",
-            "N keys", "JVT agg", "JMT individual", "Reduction"
-        );
-        for &batch_n in &batch_sizes {
+        // Batch proof comparison (estimated)
+        println!("  Batch proof (multipoint aggregation):");
+        for &batch_n in &[10usize, 100, 1000] {
             if batch_n as u32 > n {
                 continue;
             }
-            let jvt_batch = jvt_batch_proof_size_real(batch_n);
-            let jmt_batch = batch_n * jmt_single; // N individual Merkle proofs
+            let jmt_batch = batch_n * jmt_single;
             println!(
-                "    {:>6} keys | {:>8} B | {:>10} B | {:.0}×",
+                "    {} keys: JVT = {} bytes (constant!), JMT = {} bytes ({:.0}× smaller)",
                 batch_n,
-                jvt_batch,
+                MULTIPROOF_BYTES,
                 jmt_batch,
-                jmt_batch as f64 / jvt_batch as f64
+                jmt_batch as f64 / MULTIPROOF_BYTES as f64
             );
         }
-        println!();
 
-        // Commitment update cost analysis
-        println!("  Commitment update (single leaf change):");
-        println!(
-            "    JVT: {} EC scalar-muls ({} levels, O(1) per level)",
-            jvt_depth, jvt_depth
-        );
-        println!(
-            "    JMT: {} hash operations ({} levels, {} sibling reads per level)",
-            jmt_avg_depth * 16,
-            jmt_avg_depth,
-            15
-        );
-        println!();
-        println!("  ---");
+        // Real measured proof sizes (pedersen only)
+        #[cfg(feature = "pedersen")]
+        {
+            use jellyfish_verkle_tree::verkle_proof::inner as vp;
+
+            println!("  Real measured proofs:");
+
+            // Single-key IPA proof
+            let sample_key = make_key(0);
+            if let Some(real_proof) = vp::prove(&tree.store, &root_key, &sample_key) {
+                println!(
+                    "    Single IPA proof: {} bytes ({} levels)",
+                    real_proof.byte_size(),
+                    real_proof.level_proofs.len()
+                );
+            }
+
+            // Aggregated multiproofs at various batch sizes
+            for &batch_n in &[2usize, 10, 50, 100] {
+                if batch_n as u32 > n {
+                    continue;
+                }
+                let batch_keys: Vec<Key> = (0..batch_n as u32).map(make_key).collect();
+                let start = std::time::Instant::now();
+                if let Some(agg_proof) = vp::prove_aggregated(&tree.store, &root_key, &batch_keys) {
+                    let elapsed = start.elapsed();
+                    println!(
+                        "    Multiproof ({:>3} keys): {:>5} B proof, {:>6} B total, {:>3} openings, {:.1?}",
+                        batch_n,
+                        agg_proof.proof_byte_size(),
+                        agg_proof.total_byte_size(),
+                        agg_proof.verifier_queries.len(),
+                        elapsed,
+                    );
+                }
+            }
+        }
+
         println!();
     }
 
-    // Summary table
-    println!("Summary: Proof size comparison (single key, estimated real crypto)");
+    // Summary tables
+    println!("========================================");
+    println!("Summary: Single-key proof sizes");
+    println!("========================================");
     println!(
-        "{:>10} | {:>12} | {:>12} | {:>10}",
-        "Tree size", "JVT (bytes)", "JMT (bytes)", "Reduction"
+        "{:>10} | {:>10} | {:>10} | {:>8}",
+        "Keys", "JVT", "JMT", "Ratio"
     );
-    println!("{}", "-".repeat(52));
+    println!("{}", "-".repeat(46));
     for &n in &sizes {
         let jvt_depth = if n <= 256 {
             1
@@ -160,15 +188,11 @@ fn main() {
         } else {
             3
         };
-        let jmt_depth = if n > 1 {
-            (n as f64).log(16.0).ceil() as usize
-        } else {
-            1
-        };
-        let jvt = jvt_single_proof_size_real(jvt_depth);
+        let jmt_depth = (n as f64).log(16.0).ceil() as usize;
+        let jvt = jvt_depth * IPA_PROOF_BYTES + 96;
         let jmt = jmt_single_proof_size(jmt_depth);
         println!(
-            "{:>10} | {:>10} B | {:>10} B | {:>8.1}×",
+            "{:>10} | {:>8} B | {:>8} B | {:>6.1}×",
             n,
             jvt,
             jmt,
@@ -177,25 +201,38 @@ fn main() {
     }
     println!();
 
-    println!("Summary: Batch proof size (100 keys, estimated real crypto)");
+    println!("========================================");
+    println!("Summary: Batch proof sizes (multipoint)");
+    println!("========================================");
     println!(
-        "{:>10} | {:>12} | {:>12} | {:>10}",
-        "Tree size", "JVT agg", "JMT 100×ind", "Reduction"
+        "{:>10} | {:>6} | {:>10} | {:>12} | {:>8}",
+        "Keys", "Batch", "JVT proof", "JMT N×indiv", "Ratio"
     );
-    println!("{}", "-".repeat(52));
+    println!("{}", "-".repeat(58));
     for &n in &sizes {
-        if n < 100 {
-            continue;
-        }
         let jmt_depth = (n as f64).log(16.0).ceil() as usize;
-        let jvt_batch = jvt_batch_proof_size_real(100);
-        let jmt_batch = 100 * jmt_single_proof_size(jmt_depth);
-        println!(
-            "{:>10} | {:>8} B | {:>10} B | {:>8.0}×",
-            n,
-            jvt_batch,
-            jmt_batch,
-            jmt_batch as f64 / jvt_batch as f64
-        );
+        let jmt_single = jmt_single_proof_size(jmt_depth);
+        for &batch in &[10usize, 100, 1000] {
+            if batch as u32 > n {
+                continue;
+            }
+            let jmt_batch = batch * jmt_single;
+            println!(
+                "{:>10} | {:>6} | {:>8} B | {:>10} B | {:>6.0}×",
+                n,
+                batch,
+                MULTIPROOF_BYTES,
+                jmt_batch,
+                jmt_batch as f64 / MULTIPROOF_BYTES as f64
+            );
+        }
     }
+    println!();
+
+    println!(
+        "Key insight: The JVT multipoint proof is {} bytes CONSTANT,",
+        MULTIPROOF_BYTES
+    );
+    println!("regardless of how many keys are included. This is the core");
+    println!("verkle tree advantage over Merkle trees.");
 }
