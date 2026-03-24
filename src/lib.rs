@@ -23,7 +23,7 @@ pub use commitment::{zero_commitment, Commitment, FieldElement};
 pub use node::{
     Child, EaSNode, InternalNode, Key, Node, NodeKey, StaleNodeIndex, TreeUpdateBatch, Value,
 };
-pub use storage::{MemoryStore, TreeReader, TreeWriter};
+pub use storage::{MemoryStore, TreeIterator, TreeReader, TreeWriter};
 pub use tree::{
     apply_updates, get_value, root_commitment_at, verify_commitment_consistency, UpdateResult,
 };

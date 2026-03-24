@@ -1047,4 +1047,102 @@ mod tests {
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, root));
     }
+
+    // --- Iterator tests ---
+
+    #[test]
+    fn iter_all_leaves() {
+        use crate::storage::TreeIterator;
+
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(3, 0, 0), vec![30]);
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        insert(&mut store, make_key(2, 0, 0), vec![20]);
+
+        let root = store.latest_root_key().unwrap();
+        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+
+        // Should be sorted lexicographically by key
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0].0[0], 1);
+        assert_eq!(leaves[0].1, vec![10]);
+        assert_eq!(leaves[1].0[0], 2);
+        assert_eq!(leaves[1].1, vec![20]);
+        assert_eq!(leaves[2].0[0], 3);
+        assert_eq!(leaves[2].1, vec![30]);
+    }
+
+    #[test]
+    fn iter_from_key() {
+        use crate::storage::TreeIterator;
+
+        let mut store = MemoryStore::new();
+        for i in 0u8..10 {
+            insert(&mut store, make_key(i, 0, 0), vec![i]);
+        }
+
+        let root = store.latest_root_key().unwrap();
+
+        // From key 5 onwards
+        let from = make_key(5, 0, 0);
+        let leaves: Vec<_> = store.iter_leaves(root, Some(&from)).collect();
+
+        assert_eq!(leaves.len(), 5); // keys 5, 6, 7, 8, 9
+        assert_eq!(leaves[0].0[0], 5);
+        assert_eq!(leaves[4].0[0], 9);
+    }
+
+    #[test]
+    fn iter_same_stem_multiple_suffixes() {
+        use crate::storage::TreeIterator;
+
+        let mut store = MemoryStore::new();
+        // All same stem, different suffixes
+        for suffix in [3u8, 1, 4, 1, 5, 9, 2, 6] {
+            let mut key = [0u8; 32];
+            key[0] = 0xAA;
+            key[31] = suffix;
+            insert(&mut store, key, vec![suffix]);
+        }
+
+        let root = store.latest_root_key().unwrap();
+        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+
+        // Deduplicated (suffix 1 inserted twice) and sorted by suffix
+        let suffixes: Vec<u8> = leaves.iter().map(|(k, _)| k[31]).collect();
+        assert_eq!(suffixes, vec![1, 2, 3, 4, 5, 6, 9]);
+    }
+
+    #[test]
+    fn iter_empty_tree() {
+        use crate::storage::TreeIterator;
+
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        delete(&mut store, make_key(1, 0, 0));
+
+        let root = store.latest_root_key().unwrap();
+        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+        assert_eq!(leaves.len(), 0);
+    }
+
+    #[test]
+    fn iter_after_deletes() {
+        use crate::storage::TreeIterator;
+
+        let mut store = MemoryStore::new();
+        for i in 0u8..5 {
+            insert(&mut store, make_key(i, 0, 0), vec![i]);
+        }
+        delete(&mut store, make_key(1, 0, 0));
+        delete(&mut store, make_key(3, 0, 0));
+
+        let root = store.latest_root_key().unwrap();
+        let leaves: Vec<_> = store.iter_leaves(root, None).collect();
+
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0].0[0], 0);
+        assert_eq!(leaves[1].0[0], 2);
+        assert_eq!(leaves[2].0[0], 4);
+    }
 }
