@@ -505,7 +505,7 @@ pub fn prove_single<S: TreeReader>(
     root_key: &NodeKey,
     key: &Key,
 ) -> Option<VerkleProof> {
-    prove(store, root_key, &[key.clone()])
+    prove(store, root_key, std::slice::from_ref(key))
 }
 
 pub fn verify_single(
@@ -517,7 +517,7 @@ pub fn verify_single(
     verify(
         proof,
         root_commitment,
-        &[key.clone()],
+        std::slice::from_ref(key),
         &[expected_value.cloned()],
     )
 }

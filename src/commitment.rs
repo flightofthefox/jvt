@@ -47,7 +47,7 @@ static BYTE_BASIS_TABLE: std::sync::LazyLock<Vec<Vec<EdwardsProjective>>> =
 
 /// Get the precomputed byte-basis table.
 pub fn byte_basis_table() -> &'static Vec<Vec<EdwardsProjective>> {
-    &*BYTE_BASIS_TABLE
+    &BYTE_BASIS_TABLE
 }
 
 /// A Pedersen commitment (an elliptic curve point on Bandersnatch).

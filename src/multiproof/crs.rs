@@ -70,5 +70,5 @@ static SHARED_CRS: std::sync::LazyLock<CRS> =
 
 /// Get the shared CRS instance.
 pub fn shared_crs() -> &'static CRS {
-    &*SHARED_CRS
+    &SHARED_CRS
 }

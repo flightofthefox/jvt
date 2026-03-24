@@ -74,7 +74,7 @@ pub fn apply_updates<S: TreeReader>(
                     let commitment = eas.commitment();
                     let root_key = NodeKey::root(new_version);
                     let mut b = TreeUpdateBatch::default();
-                    b.put_node(root_key.clone(), Node::EaS(eas));
+                    b.put_node(root_key.clone(), Node::EaS(Box::new(eas)));
                     MutationResult::Updated(InsertResult {
                         new_node_key: root_key,
                         new_commitment: commitment,
@@ -304,9 +304,9 @@ fn insert_single<S: TreeReader>(
         Node::EaS(eas) => {
             let expected_stem = &key[depth..key_stem_end(key)];
             if eas.stem == expected_stem {
-                insert_update_eas(current_key, eas.clone(), key, value, depth, version)
+                insert_update_eas(current_key, *eas.clone(), key, value, depth, version)
             } else {
-                insert_split_eas(current_key, eas.clone(), key, value, depth, version)
+                insert_split_eas(current_key, *eas.clone(), key, value, depth, version)
             }
         }
         Node::Internal(internal) => {
@@ -322,7 +322,14 @@ fn insert_single<S: TreeReader>(
                     version,
                 )
             } else {
-                insert_into_internal_empty(current_key, internal.clone(), key, value, depth, version)
+                insert_into_internal_empty(
+                    current_key,
+                    internal.clone(),
+                    key,
+                    value,
+                    depth,
+                    version,
+                )
             }
         }
     }
@@ -343,7 +350,7 @@ fn insert_update_eas(
     let commitment = eas.commitment();
 
     let mut batch = TreeUpdateBatch::default();
-    batch.put_node(new_key.clone(), Node::EaS(eas));
+    batch.put_node(new_key.clone(), Node::EaS(Box::new(eas)));
     batch.mark_stale(old_key.clone(), version);
 
     InsertResult {
@@ -407,9 +414,12 @@ fn insert_split_eas(
 
     batch.put_node(
         NodeKey::new(version, existing_eas_path),
-        Node::EaS(existing_new_eas),
+        Node::EaS(Box::new(existing_new_eas)),
     );
-    batch.put_node(NodeKey::new(version, new_eas_path), Node::EaS(new_eas));
+    batch.put_node(
+        NodeKey::new(version, new_eas_path),
+        Node::EaS(Box::new(new_eas)),
+    );
 
     if prefix_len == 0 {
         let result_key = NodeKey::new(version, base_path.to_vec());
@@ -507,7 +517,7 @@ fn insert_into_internal_empty(
     let commitment = new_internal.commitment;
 
     let mut batch = TreeUpdateBatch::default();
-    batch.put_node(eas_key, Node::EaS(new_eas));
+    batch.put_node(eas_key, Node::EaS(Box::new(new_eas)));
     batch.put_node(new_key.clone(), Node::Internal(new_internal));
     batch.mark_stale(old_key.clone(), version);
 
@@ -559,7 +569,7 @@ fn delete_single<S: TreeReader>(
                 let new_key = NodeKey::new(version, key[..depth].to_vec());
                 let commitment = new_eas.commitment();
                 let mut batch = TreeUpdateBatch::default();
-                batch.put_node(new_key.clone(), Node::EaS(new_eas));
+                batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));
                 batch.mark_stale(current_key.clone(), version);
                 MutationResult::Updated(InsertResult {
                     new_node_key: new_key,
@@ -626,10 +636,12 @@ fn delete_single<S: TreeReader>(
                             // with a longer stem (prepend the remaining_idx byte)
                             let mut new_stem = vec![remaining_idx];
                             new_stem.extend_from_slice(&remaining_eas.stem);
-                            let collapsed = EaSNode::from_values(new_stem, remaining_eas.values.clone());
+                            let collapsed =
+                                EaSNode::from_values(new_stem, remaining_eas.values.clone());
                             let collapsed_key = NodeKey::new(version, key[..depth].to_vec());
                             let commitment = collapsed.commitment();
-                            stale_batch.put_node(collapsed_key.clone(), Node::EaS(collapsed));
+                            stale_batch
+                                .put_node(collapsed_key.clone(), Node::EaS(Box::new(collapsed)));
                             // The remaining child's old key is now stale too
                             stale_batch.mark_stale(remaining_key, version);
                             MutationResult::Updated(InsertResult {

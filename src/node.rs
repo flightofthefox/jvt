@@ -164,8 +164,12 @@ impl EaSNode {
         let c1_field = commitment_to_field(c1);
         let c2_field = commitment_to_field(c2);
         let stem_c = Self::compute_stem_commitment(&stem);
-        let extension_commitment =
-            Self::compute_extension_commitment_from_stem_cached(stem_c, stem.len(), c1_field, c2_field);
+        let extension_commitment = Self::compute_extension_commitment_from_stem_cached(
+            stem_c,
+            stem.len(),
+            c1_field,
+            c2_field,
+        );
         Self {
             stem,
             values,
@@ -300,7 +304,7 @@ impl EaSNode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Node {
     Internal(InternalNode),
-    EaS(EaSNode),
+    EaS(Box<EaSNode>),
 }
 
 impl Node {
