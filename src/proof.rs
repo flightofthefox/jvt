@@ -66,7 +66,7 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<
                     Some(child) => {
                         opening_proofs.push(OpeningProof {
                             index: child_index,
-                            claimed_value: commitment_to_field(child.commitment),
+                            claimed_value: child.field,
                         });
 
                         let child_path: Vec<u8> = key[..depth + 1].to_vec();

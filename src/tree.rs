@@ -41,6 +41,11 @@ pub fn apply_updates<S: TreeReader>(
     new_version: u64,
     updates: BTreeMap<Key, Option<Value>>,
 ) -> UpdateResult {
+    debug_assert!(
+        updates.keys().all(|k| k.len() >= 2),
+        "all keys must be at least 2 bytes (stem + suffix)"
+    );
+
     let mut overlay = OverlayStore::new(store);
     // Resolve the parent root — only set current_root_key if the node actually exists
     let mut current_root_key: Option<NodeKey> = parent_version
@@ -372,18 +377,9 @@ fn insert_split_eas(
     let mut children = HashMap::new();
     children.insert(
         existing_byte,
-        Child {
-            version,
-            commitment: existing_new_eas.commitment(),
-        },
+        Child::new(version, existing_new_eas.commitment()),
     );
-    children.insert(
-        new_byte,
-        Child {
-            version,
-            commitment: new_eas.commitment(),
-        },
-    );
+    children.insert(new_byte, Child::new(version, new_eas.commitment()));
     let diverge_node = InternalNode::new(children);
     let diverge_commitment = diverge_node.commitment;
 
@@ -435,13 +431,7 @@ fn insert_split_eas(
                 .collect();
             let child_byte = key[depth + i];
             let mut children = HashMap::new();
-            children.insert(
-                child_byte,
-                Child {
-                    version,
-                    commitment: child_commitment,
-                },
-            );
+            children.insert(child_byte, Child::new(version, child_commitment));
             let intermediate = InternalNode::new(children);
             child_commitment = intermediate.commitment;
             batch.put_node(NodeKey::new(version, path), Node::Internal(intermediate));
@@ -475,10 +465,7 @@ fn insert_into_internal_existing<S: TreeReader>(
     let mut new_internal = internal.clone();
     new_internal.update_child(
         child_index,
-        Child {
-            version,
-            commitment: child_result.new_commitment,
-        },
+        Child::new(version, child_result.new_commitment),
     );
 
     let new_key = NodeKey::new(version, key[..depth].to_vec());
@@ -513,13 +500,7 @@ fn insert_into_internal_empty(
     let eas_key = NodeKey::new(version, eas_path);
 
     let mut new_internal = internal.clone();
-    new_internal.update_child(
-        child_index,
-        Child {
-            version,
-            commitment: eas_commitment,
-        },
-    );
+    new_internal.update_child(child_index, Child::new(version, eas_commitment));
 
     let new_key = NodeKey::new(version, key[..depth].to_vec());
     let commitment = new_internal.commitment;
@@ -604,10 +585,7 @@ fn delete_single<S: TreeReader>(
                     let mut new_internal = internal.clone();
                     new_internal.update_child(
                         child_index,
-                        Child {
-                            version,
-                            commitment: child_update.new_commitment,
-                        },
+                        Child::new(version, child_update.new_commitment),
                     );
 
                     let new_key = NodeKey::new(version, key[..depth].to_vec());

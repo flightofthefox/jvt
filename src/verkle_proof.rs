@@ -34,7 +34,7 @@ static PRECOMP: std::sync::LazyLock<PrecomputedWeights> =
 fn internal_node_vector(internal: &InternalNode) -> Vec<Fr> {
     let mut v = vec![Fr::ZERO; 256];
     for (&idx, child) in &internal.children {
-        v[idx as usize] = commitment_to_field(child.commitment).0;
+        v[idx as usize] = child.field.0;
     }
     v
 }

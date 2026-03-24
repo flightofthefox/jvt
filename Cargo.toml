@@ -11,14 +11,14 @@ ark-ff = "0.5"
 ark-serialize = "0.5"
 ark-std = "0.5"
 blake3 = "1"
-serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 [dev-dependencies]
 anyhow = "1"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-proptest = "1"
+proptest = "1.11.0"
 quint-connect = "0.1"
+serde = { version = "1", features = ["derive"] }
 
 [[bench]]
 name = "comparison"

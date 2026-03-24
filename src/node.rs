@@ -28,7 +28,7 @@ pub fn key_stem_end(key: &Key) -> usize {
 }
 
 /// Node key: uniquely identifies a node in versioned storage.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeKey {
     pub version: u64,
     pub byte_path: Vec<u8>, // max length 31
@@ -58,10 +58,29 @@ impl NodeKey {
 }
 
 /// Reference to a child node stored in an internal node.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Child {
     pub version: u64,
     pub commitment: Commitment,
+    pub field: FieldElement,
+}
+
+impl PartialEq for Child {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version && self.commitment == other.commitment
+    }
+}
+
+impl Eq for Child {}
+
+impl Child {
+    pub fn new(version: u64, commitment: Commitment) -> Self {
+        Self {
+            version,
+            commitment,
+            field: commitment_to_field(commitment),
+        }
+    }
 }
 
 /// An internal node with up to 256 children.
@@ -88,7 +107,7 @@ impl InternalNode {
         commit(
             children
                 .iter()
-                .map(|(&idx, child)| (idx as usize, commitment_to_field(child.commitment))),
+                .map(|(&idx, child)| (idx as usize, child.field)),
         )
     }
 
@@ -97,11 +116,11 @@ impl InternalNode {
         let old_field = self
             .children
             .get(&index)
-            .map(|c| commitment_to_field(c.commitment))
+            .map(|c| c.field)
             .unwrap_or(field_zero());
-        let new_field = commitment_to_field(new_child.commitment);
 
-        self.commitment = commit_update(self.commitment, index as usize, old_field, new_field);
+        self.commitment =
+            commit_update(self.commitment, index as usize, old_field, new_child.field);
         self.children.insert(index, new_child);
     }
 
@@ -368,38 +387,17 @@ mod tests {
         let c_c = commit(vec![(2, value_to_field(&[30]))]);
 
         let mut children = HashMap::new();
-        children.insert(
-            0,
-            Child {
-                version: 1,
-                commitment: c_a,
-            },
-        );
-        children.insert(
-            5,
-            Child {
-                version: 1,
-                commitment: c_b,
-            },
-        );
+        children.insert(0, Child::new(1, c_a));
+        children.insert(5, Child::new(1, c_b));
         let mut node = InternalNode::new(children);
 
         // Update child 5
-        let new_child = Child {
-            version: 2,
-            commitment: c_c,
-        };
+        let new_child = Child::new(2, c_c);
         node.update_child(5, new_child.clone());
 
         // Recompute from scratch
         let mut expected_children = HashMap::new();
-        expected_children.insert(
-            0,
-            Child {
-                version: 1,
-                commitment: c_a,
-            },
-        );
+        expected_children.insert(0, Child::new(1, c_a));
         expected_children.insert(5, new_child);
         let expected = InternalNode::new(expected_children);
 

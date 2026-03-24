@@ -69,28 +69,6 @@ impl fmt::Debug for Commitment {
     }
 }
 
-// Manual serde: serialize as compressed point bytes.
-impl serde::Serialize for Commitment {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use ark_serialize::CanonicalSerialize;
-        let mut bytes = Vec::new();
-        self.0
-            .serialize_compressed(&mut bytes)
-            .map_err(serde::ser::Error::custom)?;
-        serializer.serialize_bytes(&bytes)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Commitment {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use ark_serialize::CanonicalDeserialize;
-        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
-        let point =
-            EdwardsAffine::deserialize_compressed(&bytes[..]).map_err(serde::de::Error::custom)?;
-        Ok(Commitment(point))
-    }
-}
-
 /// A scalar field element (Fr of Bandersnatch).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FieldElement(pub Fr);
