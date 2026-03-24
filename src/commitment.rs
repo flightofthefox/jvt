@@ -24,6 +24,32 @@ pub fn get_basis() -> &'static [EdwardsProjective] {
     &crate::multiproof::crs::shared_crs().g
 }
 
+/// Precomputed table: `BYTE_BASIS[position][byte_value]` = `field_from_byte(byte_value) * G_position`.
+/// This turns stem commitment computation from scalar multiplications into point additions.
+/// Table size: 256 positions × 256 byte values × 1 projective point = ~4MB.
+static BYTE_BASIS_TABLE: std::sync::LazyLock<Vec<Vec<EdwardsProjective>>> =
+    std::sync::LazyLock::new(|| {
+        let basis = get_basis();
+        (0..WIDTH)
+            .map(|pos| {
+                (0..256)
+                    .map(|byte_val| {
+                        if byte_val == 0 {
+                            EdwardsProjective::zero()
+                        } else {
+                            basis[pos] * Fr::from(byte_val as u64)
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+
+/// Get the precomputed byte-basis table.
+pub fn byte_basis_table() -> &'static Vec<Vec<EdwardsProjective>> {
+    &*BYTE_BASIS_TABLE
+}
+
 /// A Pedersen commitment (an elliptic curve point on Bandersnatch).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Commitment(pub EdwardsAffine);

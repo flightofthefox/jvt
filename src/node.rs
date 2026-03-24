@@ -170,19 +170,54 @@ impl EaSNode {
         )
     }
 
-    /// Compute the extension commitment: commit(1, stem[0], ..., stem[n-1], c1, c2)
-    pub fn compute_extension_commitment(stem: &[u8], c1: Commitment, c2: Commitment) -> Commitment {
-        let mut entries: Vec<(usize, FieldElement)> = Vec::new();
-        // Index 0: marker value 1
-        entries.push((0, field_one()));
-        // Indices 1..stem.len(): stem bytes as field elements
+    /// Compute the stem-only portion of the extension commitment:
+    /// commit(1, stem[0], ..., stem[n-1], 0, 0).
+    ///
+    /// Uses precomputed byte-basis table for fast point additions instead of
+    /// scalar multiplications.
+    pub fn compute_stem_commitment(stem: &[u8]) -> Commitment {
+        use crate::commitment::{byte_basis_table, get_basis};
+        use ark_ec::CurveGroup;
+        use ark_ed_on_bls12_381_bandersnatch::EdwardsProjective;
+
+        let table = byte_basis_table();
+        let basis = get_basis();
+
+        // marker byte (1) at index 0
+        let mut acc: EdwardsProjective = basis[0] * field_one().0;
+
+        // stem bytes via precomputed table — point addition, not scalar mul
         for (i, &byte) in stem.iter().enumerate() {
-            entries.push((i + 1, field_from_byte(byte)));
+            if byte != 0 {
+                acc += table[i + 1][byte as usize];
+            }
         }
-        // c1 and c2 as field elements
-        entries.push((stem.len() + 1, commitment_to_field(c1)));
-        entries.push((stem.len() + 2, commitment_to_field(c2)));
-        commit(entries)
+
+        Commitment(acc.into_affine())
+    }
+
+    /// Compute the extension commitment from a precomputed stem commitment.
+    /// Only 2 scalar muls instead of stem.len() + 3.
+    pub fn compute_extension_commitment_from_stem(
+        stem_commitment: Commitment,
+        stem_len: usize,
+        c1: Commitment,
+        c2: Commitment,
+    ) -> Commitment {
+        let c = commit_update(
+            stem_commitment,
+            stem_len + 1,
+            field_zero(),
+            commitment_to_field(c1),
+        );
+        commit_update(c, stem_len + 2, field_zero(), commitment_to_field(c2))
+    }
+
+    /// Compute the extension commitment: commit(1, stem[0], ..., stem[n-1], c1, c2).
+    /// Convenience that computes stem commitment from scratch.
+    pub fn compute_extension_commitment(stem: &[u8], c1: Commitment, c2: Commitment) -> Commitment {
+        let stem_c = Self::compute_stem_commitment(stem);
+        Self::compute_extension_commitment_from_stem(stem_c, stem.len(), c1, c2)
     }
 
     /// Update a single value slot, recomputing commitments.
