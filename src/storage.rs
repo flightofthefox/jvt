@@ -10,6 +10,7 @@
 //! column families and `TreeIterator` via prefix scans.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::node::{key_stem_end, Key, Node, NodeKey, StaleNodeIndex, Value};
 
@@ -19,7 +20,7 @@ use crate::node::{key_stem_end, Key, Node, NodeKey, StaleNodeIndex, Value};
 
 /// Read-only storage interface.
 pub trait TreeReader {
-    fn get_node(&self, key: &NodeKey) -> Option<Node>;
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>>;
     fn get_root_key(&self, version: u64) -> Option<NodeKey>;
 }
 
@@ -49,7 +50,7 @@ pub trait TreeIterator: TreeReader {
 /// In-memory storage backend.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
-    nodes: HashMap<NodeKey, Node>,
+    nodes: HashMap<NodeKey, Arc<Node>>,
     root_keys: HashMap<u64, NodeKey>,
     stale_index: Vec<StaleNodeIndex>,
 }
@@ -113,7 +114,7 @@ impl MemoryStore {
 // ============================================================
 
 impl TreeReader for MemoryStore {
-    fn get_node(&self, key: &NodeKey) -> Option<Node> {
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
         self.nodes.get(key).cloned()
     }
 
@@ -124,7 +125,7 @@ impl TreeReader for MemoryStore {
 
 impl TreeWriter for MemoryStore {
     fn put_node(&mut self, key: NodeKey, node: Node) {
-        self.nodes.insert(key, node);
+        self.nodes.insert(key, Arc::new(node));
     }
 
     fn set_root_key(&mut self, version: u64, key: NodeKey) {
@@ -164,7 +165,7 @@ fn collect_leaves<S: TreeReader>(
         None => return,
     };
 
-    match &node {
+    match &*node {
         Node::Internal(internal) => {
             let mut child_indices: Vec<u8> = internal.children.keys().copied().collect();
             child_indices.sort();

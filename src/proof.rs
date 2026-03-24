@@ -57,7 +57,7 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<
     loop {
         let node = store.get_node(&current_key)?;
 
-        match node {
+        match &*node {
             Node::Internal(internal) => {
                 let child_index = key[depth];
                 commitments.push(internal.commitment);

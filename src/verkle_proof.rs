@@ -99,10 +99,10 @@ fn traverse_for_key<S: TreeReader>(
     loop {
         let node = store.get_node(&current_key)?;
 
-        match node {
+        match &*node {
             Node::Internal(internal) => {
                 let child_index = key[depth];
-                let a = internal_node_vector(&internal);
+                let a = internal_node_vector(internal);
                 let claimed_value = a[child_index as usize];
 
                 openings.push((
@@ -137,7 +137,7 @@ fn traverse_for_key<S: TreeReader>(
                     let is_c2 = suffix >= 128;
 
                     // Open the marker byte (index 0) to prove this is an EaS, not an internal node
-                    let ext_vec = eas_extension_vector(&eas);
+                    let ext_vec = eas_extension_vector(eas);
                     openings.push((
                         eas.extension_commitment.0,
                         ext_vec.clone(),
@@ -159,7 +159,7 @@ fn traverse_for_key<S: TreeReader>(
                     ));
 
                     // Open c1/c2 → value
-                    let sub_vec = eas_sub_commitment_vector(&eas, is_c2);
+                    let sub_vec = eas_sub_commitment_vector(eas, is_c2);
                     let sub_commitment = if is_c2 { eas.c2 } else { eas.c1 };
                     let sub_index = if is_c2 {
                         (suffix - 128) as usize
@@ -188,7 +188,7 @@ fn traverse_for_key<S: TreeReader>(
                         .unwrap_or(eas.stem.len().min(expected_stem.len()));
 
                     // Open marker byte to prove this is an EaS, not an internal node
-                    let ext_vec = eas_extension_vector(&eas);
+                    let ext_vec = eas_extension_vector(eas);
                     openings.push((
                         eas.extension_commitment.0,
                         ext_vec.clone(),

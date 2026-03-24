@@ -5,6 +5,7 @@
 //! applies writes to storage.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::commitment::*;
 use crate::node::*;
@@ -178,7 +179,7 @@ pub fn root_commitment_at<S: TreeReader>(store: &S, version: u64) -> Commitment 
 /// A read-through overlay that layers uncommitted nodes on top of a base store.
 struct OverlayStore<'a, S> {
     base: &'a S,
-    overlay: HashMap<NodeKey, Node>,
+    overlay: HashMap<NodeKey, Arc<Node>>,
 }
 
 impl<'a, S: TreeReader> OverlayStore<'a, S> {
@@ -190,12 +191,12 @@ impl<'a, S: TreeReader> OverlayStore<'a, S> {
     }
 
     fn put(&mut self, key: NodeKey, node: Node) {
-        self.overlay.insert(key, node);
+        self.overlay.insert(key, Arc::new(node));
     }
 }
 
 impl<S: TreeReader> TreeReader for OverlayStore<'_, S> {
-    fn get_node(&self, key: &NodeKey) -> Option<Node> {
+    fn get_node(&self, key: &NodeKey) -> Option<Arc<Node>> {
         self.overlay
             .get(key)
             .cloned()
@@ -238,7 +239,7 @@ fn verify_node_commitment<S: TreeReader>(store: &S, node_key: &NodeKey) -> bool 
         None => return true,
     };
 
-    match &node {
+    match &*node {
         Node::Internal(n) => {
             let recomputed = InternalNode::compute_commitment(&n.children);
             if n.commitment != recomputed {
@@ -299,13 +300,13 @@ fn insert_single<S: TreeReader>(
         );
     });
 
-    match current_node {
+    match &*current_node {
         Node::EaS(eas) => {
             let expected_stem = &key[depth..key_stem_end(key)];
             if eas.stem == expected_stem {
-                insert_update_eas(current_key, eas, key, value, depth, version)
+                insert_update_eas(current_key, eas.clone(), key, value, depth, version)
             } else {
-                insert_split_eas(current_key, eas, key, value, depth, version)
+                insert_split_eas(current_key, eas.clone(), key, value, depth, version)
             }
         }
         Node::Internal(internal) => {
@@ -314,14 +315,14 @@ fn insert_single<S: TreeReader>(
                 insert_into_internal_existing(
                     store,
                     current_key,
-                    internal,
+                    internal.clone(),
                     key,
                     value,
                     depth,
                     version,
                 )
             } else {
-                insert_into_internal_empty(current_key, internal, key, value, depth, version)
+                insert_into_internal_empty(current_key, internal.clone(), key, value, depth, version)
             }
         }
     }
@@ -533,8 +534,8 @@ fn delete_single<S: TreeReader>(
         None => return MutationResult::Unchanged,
     };
 
-    match current_node {
-        Node::EaS(mut eas) => {
+    match &*current_node {
+        Node::EaS(eas) => {
             let expected_stem = &key[depth..key_stem_end(key)];
             if eas.stem != expected_stem {
                 return MutationResult::Unchanged; // wrong stem, key doesn't exist
@@ -544,16 +545,17 @@ fn delete_single<S: TreeReader>(
                 return MutationResult::Unchanged; // suffix slot empty, key doesn't exist
             }
 
-            eas.values.remove(&suffix);
+            let mut values = eas.values.clone();
+            values.remove(&suffix);
 
-            if eas.values.is_empty() {
+            if values.is_empty() {
                 // EaS is now empty — remove it entirely
                 let mut batch = TreeUpdateBatch::default();
                 batch.mark_stale(current_key.clone(), version);
                 MutationResult::Removed(batch)
             } else {
                 // Recompute commitments with the value removed
-                let new_eas = EaSNode::from_values(eas.stem, eas.values);
+                let new_eas = EaSNode::from_values(eas.stem.clone(), values);
                 let new_key = NodeKey::new(version, key[..depth].to_vec());
                 let commitment = new_eas.commitment();
                 let mut batch = TreeUpdateBatch::default();
@@ -581,7 +583,6 @@ fn delete_single<S: TreeReader>(
             match child_result {
                 MutationResult::Unchanged => MutationResult::Unchanged,
                 MutationResult::Updated(child_update) => {
-                    // Child was modified but still exists — update this internal node
                     let mut new_internal = internal.clone();
                     new_internal.update_child(
                         child_index,
@@ -619,12 +620,13 @@ fn delete_single<S: TreeReader>(
                             .collect();
                         let remaining_key = NodeKey::new(remaining_child.version, remaining_path);
 
-                        if let Some(Node::EaS(remaining_eas)) = store.get_node(&remaining_key) {
+                        let remaining_node = store.get_node(&remaining_key);
+                        if let Some(Node::EaS(remaining_eas)) = remaining_node.as_deref() {
                             // Collapse: merge the single-child internal + EaS into one EaS
                             // with a longer stem (prepend the remaining_idx byte)
                             let mut new_stem = vec![remaining_idx];
                             new_stem.extend_from_slice(&remaining_eas.stem);
-                            let collapsed = EaSNode::from_values(new_stem, remaining_eas.values);
+                            let collapsed = EaSNode::from_values(new_stem, remaining_eas.values.clone());
                             let collapsed_key = NodeKey::new(version, key[..depth].to_vec());
                             let commitment = collapsed.commitment();
                             stale_batch.put_node(collapsed_key.clone(), Node::EaS(collapsed));
@@ -933,7 +935,7 @@ mod tests {
 
         // The root should be an EaS now (collapsed), not an internal node
         let root_node = store.get_node(&root).unwrap();
-        assert!(matches!(root_node, Node::EaS(_)));
+        assert!(matches!(&*root_node, Node::EaS(_)));
     }
 
     #[test]
