@@ -12,25 +12,16 @@ use std::sync::LazyLock;
 use ark_ec::CurveGroup;
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, EdwardsProjective, Fr};
 use ark_ff::{AdditiveGroup, PrimeField};
-use ark_std::{UniformRand, Zero};
+use ark_std::Zero;
 
 /// Number of basis points (one per child slot in 256-ary branching).
 const WIDTH: usize = 256;
 
-/// Pre-computed basis points G_0, G_1, ..., G_255.
-/// Generated deterministically from a seed for reproducibility.
-/// In a production system these would come from a trusted setup / hash-to-curve.
-static BASIS: LazyLock<Vec<EdwardsProjective>> = LazyLock::new(|| {
-    use ark_std::rand::SeedableRng;
-    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xBADE_5A7C);
-    (0..WIDTH)
-        .map(|_| EdwardsProjective::rand(&mut rng))
-        .collect()
-});
-
-/// Get the pre-computed basis points (for use by the IPA module).
+/// Get the pre-computed basis points from the shared CRS.
+/// This ensures the tree's commitments use the same generators as the
+/// multiproof system, so proofs verify correctly.
 pub fn get_basis() -> &'static [EdwardsProjective] {
-    &*BASIS
+    &crate::multiproof::crs::shared_crs().g
 }
 
 /// A Pedersen commitment (an elliptic curve point on Bandersnatch).
@@ -120,7 +111,7 @@ pub fn commit<I>(values: I) -> Commitment
 where
     I: IntoIterator<Item = (usize, FieldElement)>,
 {
-    let basis = &*BASIS;
+    let basis = get_basis();
     let mut acc = EdwardsProjective::zero();
     for (i, v) in values {
         debug_assert!(i < WIDTH, "commitment index out of range");
@@ -137,7 +128,7 @@ pub fn commit_update(
     new_value: FieldElement,
 ) -> Commitment {
     debug_assert!(index < WIDTH);
-    let basis = &*BASIS;
+    let basis = get_basis();
     let delta = new_value.0 - old_value.0;
     let update = basis[index] * delta;
     let old_proj: EdwardsProjective = old_commitment.0.into();
