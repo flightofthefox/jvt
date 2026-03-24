@@ -85,8 +85,10 @@ pub fn create(
         // R = <a_L, G_R> + z_R * Q
         let r: EdwardsProjective = CRS::msm_proj(a_l, g_r) + q * z_r;
 
-        let l_affine = l.into_affine();
-        let r_affine = r.into_affine();
+        // Batch normalize L and R together (1 field inversion instead of 2)
+        let lr_affine = EdwardsProjective::normalize_batch(&[l, r]);
+        let l_affine = lr_affine[0];
+        let r_affine = lr_affine[1];
 
         l_vec.push(l_affine);
         r_vec.push(r_affine);

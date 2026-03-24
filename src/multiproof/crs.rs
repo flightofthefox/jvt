@@ -53,9 +53,19 @@ impl CRS {
 
     /// Multi-scalar multiplication with projective points.
     /// Used in the IPA prover where generators are folded into projective form.
+    /// Falls back to naive summation for small inputs where Pippenger overhead
+    /// (batch normalization) isn't worth it.
     pub fn msm_proj(scalars: &[Fr], points: &[EdwardsProjective]) -> EdwardsProjective {
-        let affine = EdwardsProjective::normalize_batch(points);
-        EdwardsProjective::msm(&affine, scalars).expect("length mismatch")
+        if scalars.len() < 8 {
+            scalars
+                .iter()
+                .zip(points.iter())
+                .map(|(s, p)| *p * *s)
+                .sum()
+        } else {
+            let affine = EdwardsProjective::normalize_batch(points);
+            EdwardsProjective::msm(&affine, scalars).expect("length mismatch")
+        }
     }
 }
 
