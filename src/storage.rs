@@ -64,6 +64,30 @@ impl MemoryStore {
         vs.sort();
         vs
     }
+
+    /// Apply an `UpdateResult` from `apply_updates` to this store.
+    pub fn apply(&mut self, result: &crate::tree::UpdateResult) {
+        for (nk, node) in &result.batch.new_nodes {
+            self.put_node(nk.clone(), node.clone());
+        }
+        for stale in &result.batch.stale_nodes {
+            self.record_stale(stale.clone());
+        }
+        if let Some((v, ref rk)) = result.batch.root_key {
+            self.set_root_key(v, rk.clone());
+        }
+    }
+
+    /// Get the latest version's root key (convenience for common pattern).
+    pub fn latest_root_key(&self) -> Option<&NodeKey> {
+        let max_version = self.root_keys.keys().max()?;
+        self.root_keys.get(max_version)
+    }
+
+    /// Get the latest version number.
+    pub fn latest_version(&self) -> Option<u64> {
+        self.root_keys.keys().max().copied()
+    }
 }
 
 impl TreeReader for MemoryStore {

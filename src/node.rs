@@ -253,6 +253,8 @@ pub struct StaleNodeIndex {
 pub struct TreeUpdateBatch {
     pub new_nodes: Vec<(NodeKey, Node)>,
     pub stale_nodes: Vec<StaleNodeIndex>,
+    /// The root key for the new version (version, NodeKey).
+    pub root_key: Option<(u64, NodeKey)>,
 }
 
 impl TreeUpdateBatch {

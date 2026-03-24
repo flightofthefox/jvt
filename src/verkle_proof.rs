@@ -438,7 +438,8 @@ pub mod inner {
     mod tests {
         use super::*;
         use crate::storage::MemoryStore;
-        use crate::tree::JVT;
+        use crate::tree::{apply_updates, root_commitment_at};
+        use std::collections::BTreeMap;
 
         fn make_key(first: u8, second: u8, suffix: u8) -> Key {
             let mut key = [0u8; 32];
@@ -448,191 +449,177 @@ pub mod inner {
             key
         }
 
-        // --- Individual proof tests (unchanged) ---
+        fn insert(store: &mut MemoryStore, key: Key, value: Value) {
+            let parent = store.latest_version();
+            let new_version = parent.map_or(1, |v| v + 1);
+            let mut updates = BTreeMap::new();
+            updates.insert(key, Some(value));
+            let result = apply_updates(store, parent, new_version, updates);
+            store.apply(&result);
+        }
+
+        fn root_c(store: &MemoryStore) -> Commitment {
+            root_commitment_at(store, store.latest_version().unwrap())
+        }
+
+        // --- Individual proof tests ---
 
         #[test]
         fn real_proof_single_key() {
-            let mut tree = JVT::new(MemoryStore::new());
+            let mut store = MemoryStore::new();
             let key = make_key(1, 2, 3);
             let value = vec![42];
-            tree.insert(key, value.clone());
+            insert(&mut store, key, value.clone());
 
-            let root_key = NodeKey::root(tree.current_version());
-            let proof = prove(&tree.store, &root_key, &key).unwrap();
-
+            let rk = store.latest_root_key().unwrap();
+            let proof = prove(&store, rk, &key).unwrap();
             assert!(proof.inclusion);
             assert_eq!(proof.value, Some(value.clone()));
-
-            let root_c = tree.root_commitment();
-            assert!(verify(&proof, root_c, &key, Some(&value)));
+            assert!(verify(&proof, root_c(&store), &key, Some(&value)));
         }
 
         #[test]
         fn real_proof_after_split() {
-            let mut tree = JVT::new(MemoryStore::new());
-            let key1 = make_key(1, 0, 0);
-            let key2 = make_key(2, 0, 0);
-            tree.insert(key1, vec![10]);
-            tree.insert(key2, vec![20]);
+            let mut store = MemoryStore::new();
+            insert(&mut store, make_key(1, 0, 0), vec![10]);
+            insert(&mut store, make_key(2, 0, 0), vec![20]);
 
-            let root_key = NodeKey::root(tree.current_version());
-            let root_c = tree.root_commitment();
+            let rk = store.latest_root_key().unwrap();
+            let rc = root_c(&store);
 
-            let proof1 = prove(&tree.store, &root_key, &key1).unwrap();
-            assert!(verify(&proof1, root_c, &key1, Some(&vec![10])));
+            let p1 = prove(&store, rk, &make_key(1, 0, 0)).unwrap();
+            assert!(verify(&p1, rc, &make_key(1, 0, 0), Some(&vec![10])));
 
-            let proof2 = prove(&tree.store, &root_key, &key2).unwrap();
-            assert!(verify(&proof2, root_c, &key2, Some(&vec![20])));
+            let p2 = prove(&store, rk, &make_key(2, 0, 0)).unwrap();
+            assert!(verify(&p2, rc, &make_key(2, 0, 0), Some(&vec![20])));
         }
 
         // --- Aggregated multiproof tests ---
 
         #[test]
         fn aggregated_proof_single_key() {
-            let mut tree = JVT::new(MemoryStore::new());
+            let mut store = MemoryStore::new();
             let key = make_key(1, 2, 3);
             let value = vec![42];
-            tree.insert(key, value.clone());
+            insert(&mut store, key, value.clone());
 
-            // Single key — root is EaS, no internal nodes, empty proof
-            let root_key = NodeKey::root(tree.current_version());
-            let root_c = tree.root_commitment();
-
-            let proof = prove_aggregated(&tree.store, &root_key, &[key]).unwrap();
-            assert!(verify_aggregated(&proof, root_c, &[key], &[Some(value)]));
+            let rk = store.latest_root_key().unwrap();
+            let proof = prove_aggregated(&store, rk, &[key]).unwrap();
+            assert!(verify_aggregated(
+                &proof,
+                root_c(&store),
+                &[key],
+                &[Some(value)]
+            ));
         }
 
         #[test]
         fn aggregated_proof_two_keys() {
-            let mut tree = JVT::new(MemoryStore::new());
-            let key1 = make_key(1, 0, 0);
-            let key2 = make_key(2, 0, 0);
-            let val1 = vec![10];
-            let val2 = vec![20];
-            tree.insert(key1, val1.clone());
-            tree.insert(key2, val2.clone());
+            let mut store = MemoryStore::new();
+            insert(&mut store, make_key(1, 0, 0), vec![10]);
+            insert(&mut store, make_key(2, 0, 0), vec![20]);
 
-            let root_key = NodeKey::root(tree.current_version());
-            let root_c = tree.root_commitment();
+            let rk = store.latest_root_key().unwrap();
+            let rc = root_c(&store);
 
-            let proof = prove_aggregated(&tree.store, &root_key, &[key1, key2]).unwrap();
-
+            let proof =
+                prove_aggregated(&store, rk, &[make_key(1, 0, 0), make_key(2, 0, 0)]).unwrap();
             println!(
                 "Aggregated proof (2 keys): {} bytes proof, {} bytes total",
                 proof.proof_byte_size(),
                 proof.total_byte_size()
             );
-            assert_eq!(proof.proof_byte_size(), 576); // constant!
-
+            assert_eq!(proof.proof_byte_size(), 576);
             assert!(verify_aggregated(
                 &proof,
-                root_c,
-                &[key1, key2],
-                &[Some(val1), Some(val2)],
+                rc,
+                &[make_key(1, 0, 0), make_key(2, 0, 0)],
+                &[Some(vec![10]), Some(vec![20])]
             ));
         }
 
         #[test]
         fn aggregated_proof_many_keys() {
-            let mut tree = JVT::new(MemoryStore::new());
+            let mut store = MemoryStore::new();
             let keys: Vec<Key> = (0..20u8)
                 .map(|i| make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)))
                 .collect();
             let values: Vec<Value> = (0..20u8).map(|i| vec![i]).collect();
-
             for (k, v) in keys.iter().zip(values.iter()) {
-                tree.insert(*k, v.clone());
+                insert(&mut store, *k, v.clone());
             }
 
-            let root_key = NodeKey::root(tree.current_version());
-            let root_c = tree.root_commitment();
-
-            let proof = prove_aggregated(&tree.store, &root_key, &keys).unwrap();
-
+            let rk = store.latest_root_key().unwrap();
+            let proof = prove_aggregated(&store, rk, &keys).unwrap();
             println!(
-                "Aggregated proof (20 keys): {} bytes proof, {} bytes total, {} openings",
+                "Aggregated proof (20 keys): {} bytes proof, {} openings",
                 proof.proof_byte_size(),
-                proof.total_byte_size(),
                 proof.verifier_queries.len()
             );
-            assert_eq!(proof.proof_byte_size(), 576); // still constant!
+            assert_eq!(proof.proof_byte_size(), 576);
 
             let expected: Vec<Option<Value>> = values.into_iter().map(Some).collect();
-            assert!(verify_aggregated(&proof, root_c, &keys, &expected));
+            assert!(verify_aggregated(&proof, root_c(&store), &keys, &expected));
         }
 
         #[test]
         fn aggregated_proof_rejects_wrong_value() {
-            let mut tree = JVT::new(MemoryStore::new());
-            let key1 = make_key(1, 0, 0);
-            let key2 = make_key(2, 0, 0);
-            tree.insert(key1, vec![10]);
-            tree.insert(key2, vec![20]);
+            let mut store = MemoryStore::new();
+            insert(&mut store, make_key(1, 0, 0), vec![10]);
+            insert(&mut store, make_key(2, 0, 0), vec![20]);
 
-            let root_key = NodeKey::root(tree.current_version());
-            let root_c = tree.root_commitment();
-
-            let proof = prove_aggregated(&tree.store, &root_key, &[key1, key2]).unwrap();
-
-            // Wrong value for key2
+            let rk = store.latest_root_key().unwrap();
+            let proof =
+                prove_aggregated(&store, rk, &[make_key(1, 0, 0), make_key(2, 0, 0)]).unwrap();
             assert!(!verify_aggregated(
                 &proof,
-                root_c,
-                &[key1, key2],
-                &[Some(vec![10]), Some(vec![99])],
+                root_c(&store),
+                &[make_key(1, 0, 0), make_key(2, 0, 0)],
+                &[Some(vec![10]), Some(vec![99])]
             ));
         }
 
         #[test]
         fn aggregated_proof_with_shared_internal_nodes() {
-            // Keys that share the first byte go through the same root internal node
-            let mut tree = JVT::new(MemoryStore::new());
-            let key1 = make_key(5, 1, 0);
-            let key2 = make_key(5, 2, 0);
-            let key3 = make_key(6, 0, 0);
-            tree.insert(key1, vec![10]);
-            tree.insert(key2, vec![20]);
-            tree.insert(key3, vec![30]);
+            let mut store = MemoryStore::new();
+            insert(&mut store, make_key(5, 1, 0), vec![10]);
+            insert(&mut store, make_key(5, 2, 0), vec![20]);
+            insert(&mut store, make_key(6, 0, 0), vec![30]);
 
-            let root_key = NodeKey::root(tree.current_version());
-            let root_c = tree.root_commitment();
-
-            let proof = prove_aggregated(&tree.store, &root_key, &[key1, key2, key3]).unwrap();
-
+            let rk = store.latest_root_key().unwrap();
+            let proof = prove_aggregated(
+                &store,
+                rk,
+                &[make_key(5, 1, 0), make_key(5, 2, 0), make_key(6, 0, 0)],
+            )
+            .unwrap();
             println!(
                 "Shared nodes proof (3 keys): {} bytes proof, {} openings (deduplicated)",
                 proof.proof_byte_size(),
                 proof.verifier_queries.len()
             );
-
             assert!(verify_aggregated(
                 &proof,
-                root_c,
-                &[key1, key2, key3],
-                &[Some(vec![10]), Some(vec![20]), Some(vec![30])],
+                root_c(&store),
+                &[make_key(5, 1, 0), make_key(5, 2, 0), make_key(6, 0, 0)],
+                &[Some(vec![10]), Some(vec![20]), Some(vec![30])]
             ));
         }
 
         #[test]
         fn aggregated_proof_nonexistent_key() {
-            let mut tree = JVT::new(MemoryStore::new());
-            let key1 = make_key(1, 0, 0);
-            let key2 = make_key(2, 0, 0);
-            tree.insert(key1, vec![10]);
-            tree.insert(key2, vec![20]);
+            let mut store = MemoryStore::new();
+            insert(&mut store, make_key(1, 0, 0), vec![10]);
+            insert(&mut store, make_key(2, 0, 0), vec![20]);
 
-            let root_key = NodeKey::root(tree.current_version());
-            let root_c = tree.root_commitment();
-
-            // Prove key1 (exists) and key3 (doesn't exist, stem mismatch at EaS)
+            let rk = store.latest_root_key().unwrap();
             let key3 = make_key(1, 99, 0);
-            let proof = prove_aggregated(&tree.store, &root_key, &[key1, key3]).unwrap();
-
+            let proof = prove_aggregated(&store, rk, &[make_key(1, 0, 0), key3]).unwrap();
             assert!(verify_aggregated(
                 &proof,
-                root_c,
-                &[key1, key3],
-                &[Some(vec![10]), None],
+                root_c(&store),
+                &[make_key(1, 0, 0), key3],
+                &[Some(vec![10]), None]
             ));
         }
     }

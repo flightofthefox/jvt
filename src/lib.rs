@@ -2,6 +2,13 @@
 //!
 //! Combines JMT's version-based persistent storage with verkle tree
 //! vector commitments for efficient proof aggregation.
+//!
+//! # API
+//!
+//! All operations are stateless:
+//! - `apply_updates(store, parent_version, new_version, updates) -> UpdateResult`
+//! - `get_value(store, root_key, key) -> Option<Value>`
+//! - `verify_commitment_consistency(store, root_key) -> bool`
 
 pub mod commitment;
 pub mod ipa;
@@ -12,7 +19,12 @@ pub mod storage;
 pub mod tree;
 pub mod verkle_proof;
 
-pub use commitment::{zero_commitment, Commitment};
-pub use node::{Key, NodeKey, Value};
-pub use storage::MemoryStore;
-pub use tree::JVT;
+// Core types
+pub use commitment::{zero_commitment, Commitment, FieldElement};
+pub use node::{
+    Child, EaSNode, InternalNode, Key, Node, NodeKey, StaleNodeIndex, TreeUpdateBatch, Value,
+};
+pub use storage::{MemoryStore, TreeReader, TreeWriter};
+pub use tree::{
+    apply_updates, get_value, root_commitment_at, verify_commitment_consistency, UpdateResult,
+};

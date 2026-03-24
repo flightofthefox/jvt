@@ -222,7 +222,8 @@ pub fn verify_batch(
 mod tests {
     use super::*;
     use crate::storage::MemoryStore;
-    use crate::tree::JVT;
+    use crate::tree::{apply_updates, root_commitment_at};
+    use std::collections::BTreeMap;
 
     fn make_key(first: u8, second: u8, suffix: u8) -> Key {
         let mut key = [0u8; 32];
@@ -232,15 +233,24 @@ mod tests {
         key
     }
 
+    fn insert(store: &mut MemoryStore, key: Key, value: Value) {
+        let parent = store.latest_version();
+        let new_version = parent.map_or(1, |v| v + 1);
+        let mut updates = BTreeMap::new();
+        updates.insert(key, Some(value));
+        let result = apply_updates(store, parent, new_version, updates);
+        store.apply(&result);
+    }
+
     #[test]
     fn prove_single_key_inclusion() {
-        let mut tree = JVT::new(MemoryStore::new());
+        let mut store = MemoryStore::new();
         let key = make_key(1, 2, 3);
         let value = vec![42];
-        tree.insert(key, value.clone());
+        insert(&mut store, key, value.clone());
 
-        let root_key = NodeKey::root(tree.current_version());
-        let proof = prove(&tree.store, &root_key, &key).unwrap();
+        let root_key = store.latest_root_key().unwrap();
+        let proof = prove(&store, root_key, &key).unwrap();
 
         assert!(proof.inclusion);
         assert_eq!(proof.value, Some(value));
@@ -248,15 +258,12 @@ mod tests {
 
     #[test]
     fn prove_nonexistent_key() {
-        let mut tree = JVT::new(MemoryStore::new());
-        let key1 = make_key(1, 2, 3);
-        tree.insert(key1, vec![42]);
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 2, 3), vec![42]);
 
-        // Different first byte — after split, this would be an empty child slot
         let key2 = make_key(5, 6, 7);
-        // But wait — only one key inserted, root is an EaS with stem mismatch
-        let root_key = NodeKey::root(tree.current_version());
-        let proof = prove(&tree.store, &root_key, &key2).unwrap();
+        let root_key = store.latest_root_key().unwrap();
+        let proof = prove(&store, root_key, &key2).unwrap();
 
         assert!(!proof.inclusion);
         assert_eq!(proof.value, None);
@@ -264,37 +271,35 @@ mod tests {
 
     #[test]
     fn prove_after_split() {
-        let mut tree = JVT::new(MemoryStore::new());
-        let key1 = make_key(1, 0, 0);
-        let key2 = make_key(2, 0, 0);
-        tree.insert(key1, vec![10]);
-        tree.insert(key2, vec![20]);
+        let mut store = MemoryStore::new();
+        insert(&mut store, make_key(1, 0, 0), vec![10]);
+        insert(&mut store, make_key(2, 0, 0), vec![20]);
 
-        let root_key = NodeKey::root(tree.current_version());
+        let root_key = store.latest_root_key().unwrap();
 
-        let proof1 = prove(&tree.store, &root_key, &key1).unwrap();
+        let proof1 = prove(&store, root_key, &make_key(1, 0, 0)).unwrap();
         assert!(proof1.inclusion);
         assert_eq!(proof1.value, Some(vec![10]));
 
-        let proof2 = prove(&tree.store, &root_key, &key2).unwrap();
+        let proof2 = prove(&store, root_key, &make_key(2, 0, 0)).unwrap();
         assert!(proof2.inclusion);
         assert_eq!(proof2.value, Some(vec![20]));
     }
 
     #[test]
     fn batch_prove_and_verify() {
-        let mut tree = JVT::new(MemoryStore::new());
+        let mut store = MemoryStore::new();
         let keys: Vec<Key> = (0..5).map(|i| make_key(i, 0, 0)).collect();
         let values: Vec<Value> = (0..5).map(|i| vec![i * 10]).collect();
 
         for (k, v) in keys.iter().zip(values.iter()) {
-            tree.insert(*k, v.clone());
+            insert(&mut store, *k, v.clone());
         }
 
-        let root_key = NodeKey::root(tree.current_version());
-        let root_c = tree.root_commitment();
+        let root_key = store.latest_root_key().unwrap();
+        let root_c = root_commitment_at(&store, store.latest_version().unwrap());
 
-        let batch_proof = prove_batch(&tree.store, &root_key, &keys).unwrap();
+        let batch_proof = prove_batch(&store, root_key, &keys).unwrap();
         let expected_values: Vec<Option<Value>> = values.into_iter().map(Some).collect();
 
         assert!(verify_batch(&batch_proof, root_c, &keys, &expected_values));

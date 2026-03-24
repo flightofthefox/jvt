@@ -16,7 +16,6 @@ pub mod inner {
     use ark_ec::CurveGroup;
     use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, EdwardsProjective, Fr};
     use ark_ff::{AdditiveGroup, BigInteger, Field, PrimeField};
-    use ark_std::Zero;
     use sha2::{Digest, Sha256};
 
     use crate::commitment::pedersen;
