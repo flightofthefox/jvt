@@ -12,18 +12,18 @@ use jellyfish_verkle_tree::{
 };
 
 fn make_key(first: u8, second: u8, suffix: u8) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = vec![0u8; 32];
     key[0] = first;
     key[1] = second;
     key[31] = suffix;
     key
 }
 
-fn insert(store: &mut MemoryStore, key: Key, value: Value) {
+fn insert(store: &mut MemoryStore, key: &Key, value: Value) {
     let parent = store.latest_version();
     let new_version = parent.map_or(1, |v| v + 1);
     let mut updates = BTreeMap::new();
-    updates.insert(key, Some(value));
+    updates.insert(key.clone(), Some(value));
     let result = apply_updates(store, parent, new_version, updates);
     store.apply(&result);
 }
@@ -38,7 +38,7 @@ fn build_store(n: u8) -> MemoryStore {
     for i in 0..n {
         insert(
             &mut store,
-            make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)),
+            &make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)),
             vec![i],
         );
     }
@@ -89,7 +89,7 @@ fn reject_proof_against_wrong_root() {
     let proof = verkle_proof::prove_single(&store, &rk, &key).unwrap();
 
     // Insert more keys to change the root
-    insert(&mut store, make_key(50, 0, 0), vec![50]);
+    insert(&mut store, &make_key(50, 0, 0), vec![50]);
     let new_root = root_c(&store);
 
     // Proof against old root should fail against new root
@@ -198,7 +198,7 @@ fn reject_inclusion_for_absent_key() {
 #[test]
 fn single_key_tree() {
     let mut store = MemoryStore::new();
-    insert(&mut store, make_key(42, 0, 0), vec![100]);
+    insert(&mut store, &make_key(42, 0, 0), vec![100]);
 
     let rk = store.latest_root_key().unwrap();
     let proof = verkle_proof::prove_single(&store, &rk, &make_key(42, 0, 0)).unwrap();
@@ -217,8 +217,8 @@ fn single_key_tree() {
 #[test]
 fn zero_value() {
     let mut store = MemoryStore::new();
-    insert(&mut store, make_key(1, 0, 0), vec![0]); // value is zero byte
-    insert(&mut store, make_key(2, 0, 0), vec![]); // value is empty vec
+    insert(&mut store, &make_key(1, 0, 0), vec![0]); // value is zero byte
+    insert(&mut store, &make_key(2, 0, 0), vec![]); // value is empty vec
 
     let rk = store.latest_root_key().unwrap();
 
@@ -244,17 +244,17 @@ fn same_stem_different_suffixes() {
     // Many keys sharing the same stem (bytes 0..30) but different suffix (byte 31)
     let mut store = MemoryStore::new();
     for suffix in 0..10u8 {
-        let mut key = [0u8; 32];
+        let mut key = vec![0u8; 32];
         key[0] = 1;
         key[31] = suffix;
-        insert(&mut store, key, vec![suffix]);
+        insert(&mut store, &key, vec![suffix]);
     }
 
     let rk = store.latest_root_key().unwrap();
 
     // All values stored in the same EaS node
     for suffix in 0..10u8 {
-        let mut key = [0u8; 32];
+        let mut key = vec![0u8; 32];
         key[0] = 1;
         key[31] = suffix;
         assert_eq!(get_value(&store, &rk, &key), Some(vec![suffix]));
@@ -263,7 +263,7 @@ fn same_stem_different_suffixes() {
     // Batch proof for all of them
     let keys: Vec<Key> = (0..10u8)
         .map(|s| {
-            let mut k = [0u8; 32];
+            let mut k = vec![0u8; 32];
             k[0] = 1;
             k[31] = s;
             k
@@ -307,15 +307,15 @@ fn commitment_consistency_after_many_operations() {
 
     // Insert, update, insert more
     for i in 0u8..30 {
-        insert(&mut store, make_key(i, 0, 0), vec![i]);
+        insert(&mut store, &make_key(i, 0, 0), vec![i]);
     }
     // Update some existing keys
     for i in 0u8..10 {
-        insert(&mut store, make_key(i, 0, 0), vec![i + 100]);
+        insert(&mut store, &make_key(i, 0, 0), vec![i + 100]);
     }
     // Insert keys that cause splits at various depths
     for i in 0u8..10 {
-        insert(&mut store, make_key(0, i, 0), vec![i + 200]);
+        insert(&mut store, &make_key(0, i, 0), vec![i + 200]);
     }
 
     let rk = store.latest_root_key().unwrap();
@@ -339,13 +339,13 @@ fn empty_tree_proof() {
 fn versioned_proofs_independent() {
     let mut store = MemoryStore::new();
     // Need multiple keys so we have internal nodes (multiproof openings)
-    insert(&mut store, make_key(1, 0, 0), vec![10]);
-    insert(&mut store, make_key(2, 0, 0), vec![20]);
+    insert(&mut store, &make_key(1, 0, 0), vec![10]);
+    insert(&mut store, &make_key(2, 0, 0), vec![20]);
     let v2_root = store.latest_root_key().unwrap().clone();
     let v2_commitment = root_c(&store);
 
     // Update key 1 — changes the root commitment
-    insert(&mut store, make_key(1, 0, 0), vec![99]);
+    insert(&mut store, &make_key(1, 0, 0), vec![99]);
     let _v3_root = store.latest_root_key().unwrap().clone();
     let v3_commitment = root_c(&store);
     assert_ne!(v2_commitment, v3_commitment);

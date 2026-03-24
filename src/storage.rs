@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::node::{Key, Node, NodeKey, StaleNodeIndex, Value};
+use crate::node::{key_stem_end, Key, Node, NodeKey, StaleNodeIndex, Value};
 
 // ============================================================
 // Traits
@@ -170,13 +170,15 @@ fn collect_leaves<S: TreeReader>(
             child_indices.sort();
 
             let depth = path_prefix.len();
-            let min_child = from.filter(|_| depth < 31).and_then(|from_key| {
-                if from_key[..depth] == path_prefix[..] {
-                    Some(from_key[depth])
-                } else {
-                    None
-                }
-            });
+            let min_child = from
+                .filter(|from_key| depth < key_stem_end(from_key))
+                .and_then(|from_key| {
+                    if from_key[..depth] == path_prefix[..] {
+                        Some(from_key[depth])
+                    } else {
+                        None
+                    }
+                });
 
             for &child_idx in &child_indices {
                 if let Some(min) = min_child {
@@ -204,10 +206,11 @@ fn collect_leaves<S: TreeReader>(
             suffix_keys.sort();
 
             for suffix in suffix_keys {
-                let mut full_key = [0u8; 32];
+                let key_len = depth + eas.stem.len() + 1;
+                let mut full_key = vec![0u8; key_len];
                 full_key[..depth].copy_from_slice(path_prefix);
-                full_key[depth..31].copy_from_slice(&eas.stem);
-                full_key[31] = suffix;
+                full_key[depth..key_len - 1].copy_from_slice(&eas.stem);
+                full_key[key_len - 1] = suffix;
 
                 if let Some(from_key) = from {
                     if full_key < *from_key {

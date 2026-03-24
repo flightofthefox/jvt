@@ -9,17 +9,17 @@ use jellyfish_verkle_tree::proof;
 use jellyfish_verkle_tree::{apply_updates, Key, MemoryStore};
 
 fn make_key(i: u32) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = vec![0u8; 32];
     key[0..4].copy_from_slice(&i.to_be_bytes());
     key[31] = (i & 0xFF) as u8;
     key
 }
 
-fn insert(store: &mut MemoryStore, key: Key, value: Vec<u8>) {
+fn insert(store: &mut MemoryStore, key: &Key, value: Vec<u8>) {
     let parent = store.latest_version();
     let new_version = parent.map_or(1, |v| v + 1);
     let mut updates = BTreeMap::new();
-    updates.insert(key, Some(value));
+    updates.insert(key.clone(), Some(value));
     let result = apply_updates(store, parent, new_version, updates);
     store.apply(&result);
 }
@@ -57,7 +57,7 @@ fn main() {
     for &n in &sizes {
         let mut store = MemoryStore::new();
         for i in 0..n {
-            insert(&mut store, make_key(i), vec![(i & 0xFF) as u8; 32]);
+            insert(&mut store, &make_key(i), vec![(i & 0xFF) as u8; 32]);
         }
 
         let root_key = store.latest_root_key().unwrap();

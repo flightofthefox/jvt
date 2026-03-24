@@ -10,17 +10,17 @@ use jellyfish_verkle_tree::{
 use std::hint::black_box;
 
 fn make_key(i: u32) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = vec![0u8; 32];
     key[0..4].copy_from_slice(&i.to_be_bytes());
     key[31] = (i & 0xFF) as u8;
     key
 }
 
-fn insert(store: &mut MemoryStore, key: Key, value: Vec<u8>) {
+fn insert(store: &mut MemoryStore, key: &Key, value: Vec<u8>) {
     let parent = store.latest_version();
     let new_version = parent.map_or(1, |v| v + 1);
     let mut updates = BTreeMap::new();
-    updates.insert(key, Some(value));
+    updates.insert(key.clone(), Some(value));
     let result = apply_updates(store, parent, new_version, updates);
     store.apply(&result);
 }
@@ -28,7 +28,7 @@ fn insert(store: &mut MemoryStore, key: Key, value: Vec<u8>) {
 fn build_store(n: u32) -> MemoryStore {
     let mut store = MemoryStore::new();
     for i in 0..n {
-        insert(&mut store, make_key(i), vec![(i & 0xFF) as u8; 32]);
+        insert(&mut store, &make_key(i), vec![(i & 0xFF) as u8; 32]);
     }
     store
 }
@@ -41,7 +41,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
             b.iter(|| {
                 let mut store = MemoryStore::new();
                 for i in 0..n {
-                    insert(&mut store, make_key(i), vec![(i & 0xFF) as u8; 32]);
+                    insert(&mut store, &make_key(i), vec![(i & 0xFF) as u8; 32]);
                 }
                 black_box(root_commitment_at(&store, store.latest_version().unwrap()));
             });
@@ -55,7 +55,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
             b.iter_batched(
                 || store.clone(),
                 |mut s| {
-                    insert(&mut s, new_key, vec![42; 32]);
+                    insert(&mut s, &new_key, vec![42; 32]);
                     black_box(());
                 },
                 criterion::BatchSize::SmallInput,
@@ -101,7 +101,7 @@ fn bench_commitment_update(c: &mut Criterion) {
             b.iter_batched(
                 || store.clone(),
                 |mut s| {
-                    insert(&mut s, key, vec![99; 32]);
+                    insert(&mut s, &key, vec![99; 32]);
                     black_box(());
                 },
                 criterion::BatchSize::SmallInput,

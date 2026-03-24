@@ -9,14 +9,23 @@ use std::collections::HashMap;
 
 use crate::commitment::*;
 
-/// Maximum stem length (31 bytes — key bytes 0..30 are for tree+stem, byte 31 is suffix).
-pub const MAX_STEM_LEN: usize = 31;
-
-/// A 32-byte key.
-pub type Key = [u8; 32];
+/// A variable-length key. The last byte is the suffix (EaS value slot index),
+/// all preceding bytes are used for tree traversal and stem.
+/// Minimum length: 2 bytes (1 byte traversal + 1 byte suffix).
+pub type Key = Vec<u8>;
 
 /// A value stored in the tree.
 pub type Value = Vec<u8>;
+
+/// Key helper: the suffix byte (last byte, selects the EaS value slot).
+pub fn key_suffix(key: &Key) -> u8 {
+    key[key.len() - 1]
+}
+
+/// Key helper: the stem end index (everything before the suffix).
+pub fn key_stem_end(key: &Key) -> usize {
+    key.len() - 1
+}
 
 /// Node key: uniquely identifies a node in versioned storage.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -27,7 +36,6 @@ pub struct NodeKey {
 
 impl NodeKey {
     pub fn new(version: u64, byte_path: Vec<u8>) -> Self {
-        debug_assert!(byte_path.len() <= MAX_STEM_LEN);
         Self { version, byte_path }
     }
 

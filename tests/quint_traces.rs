@@ -27,7 +27,7 @@ impl Default for JvtDriver {
 
 impl JvtDriver {
     fn do_insert(&mut self, key0: i64, key1: i64, suffix: i64, value: i64) {
-        let mut key = [0u8; 32];
+        let mut key = vec![0u8; 32];
         key[0] = key0 as u8;
         key[1] = key1 as u8;
         key[31] = suffix as u8;
@@ -35,7 +35,7 @@ impl JvtDriver {
         let parent = self.store.latest_version();
         let new_version = parent.map_or(1, |v| v + 1);
         let mut updates = BTreeMap::new();
-        updates.insert(key, Some(value.to_le_bytes().to_vec()));
+        updates.insert(key.clone(), Some(value.to_le_bytes().to_vec()));
         let result = apply_updates(&self.store, parent, new_version, updates);
         self.store.apply(&result);
 

@@ -9,7 +9,7 @@ use jellyfish_verkle_tree::{
 };
 
 fn make_key(bytes: &[u8]) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = vec![0u8; 32];
     for (i, &b) in bytes.iter().enumerate().take(32) {
         key[i] = b;
     }
@@ -24,7 +24,7 @@ fn main() {
 
     let key_alice = make_key(b"alice");
     let mut updates = BTreeMap::new();
-    updates.insert(key_alice, Some(b"alice's balance: 100".to_vec()));
+    updates.insert(key_alice.clone(), Some(b"alice's balance: 100".to_vec()));
 
     let result = apply_updates(&store, None, 1, updates);
     println!("   Root commitment after v1: {:?}", result.root_commitment);
@@ -44,17 +44,17 @@ fn main() {
     let key_dave = make_key(b"dave");
 
     let mut updates = BTreeMap::new();
-    updates.insert(key_bob, Some(b"bob's balance: 200".to_vec()));
-    updates.insert(key_charlie, Some(b"charlie's balance: 50".to_vec()));
-    updates.insert(key_dave, Some(b"dave's balance: 0".to_vec()));
+    updates.insert(key_bob.clone(), Some(b"bob's balance: 200".to_vec()));
+    updates.insert(key_charlie.clone(), Some(b"charlie's balance: 50".to_vec()));
+    updates.insert(key_dave.clone(), Some(b"dave's balance: 0".to_vec()));
 
     let result = apply_updates(&store, Some(1), 2, updates);
     store.apply(&result);
 
     for (name, key) in [
-        ("bob", key_bob),
-        ("charlie", key_charlie),
-        ("dave", key_dave),
+        ("bob", key_bob.clone()),
+        ("charlie", key_charlie.clone()),
+        ("dave", key_dave.clone()),
     ] {
         let val = get_value(&store, &store.latest_root_key().unwrap(), &key).unwrap();
         println!("   get({name}) = {}", String::from_utf8_lossy(&val));
@@ -64,7 +64,7 @@ fn main() {
     println!("\n3. Update existing key");
 
     let mut updates = BTreeMap::new();
-    updates.insert(key_alice, Some(b"alice's balance: 75".to_vec()));
+    updates.insert(key_alice.clone(), Some(b"alice's balance: 75".to_vec()));
 
     let result = apply_updates(&store, Some(2), 3, updates);
     store.apply(&result);
@@ -79,7 +79,7 @@ fn main() {
     println!("\n4. Delete a key");
 
     let mut updates = BTreeMap::new();
-    updates.insert(key_dave, None); // None = delete
+    updates.insert(key_dave.clone(), None); // None = delete
 
     let result = apply_updates(&store, Some(3), 4, updates);
     store.apply(&result);

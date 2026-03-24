@@ -14,7 +14,7 @@ use jellyfish_verkle_tree::{
 
 /// Encode an address + storage slot into a 32-byte key.
 fn account_key(address: u8, slot: u8) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = vec![0u8; 32];
     key[0] = address;
     key[31] = slot;
     key

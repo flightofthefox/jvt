@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use jellyfish_verkle_tree::{apply_updates, get_value, verkle_proof, Key, MemoryStore};
 
 fn make_key(prefix: &[u8]) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = vec![0u8; 32];
     for (i, &b) in prefix.iter().enumerate().take(32) {
         key[i] = b;
     }
@@ -29,8 +29,10 @@ fn main() {
         (make_key(&[0xFF, 0xEE, 0xDD]), b"fifth".to_vec()),
     ];
 
-    let updates: BTreeMap<Key, Option<Vec<u8>>> =
-        entries.iter().map(|(k, v)| (*k, Some(v.clone()))).collect();
+    let updates: BTreeMap<Key, Option<Vec<u8>>> = entries
+        .iter()
+        .map(|(k, v)| (k.clone(), Some(v.clone())))
+        .collect();
 
     let result = apply_updates(&store, None, 1, updates);
     let root_commitment = result.root_commitment;
@@ -41,7 +43,7 @@ fn main() {
     // ── 1. Single-key inclusion proof ───────────────────────────
     println!("1. Single-key inclusion proof");
 
-    let key = entries[0].0;
+    let key = entries[0].0.clone();
     let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
     let value = get_value(&store, &root_key, &key);
 
@@ -85,7 +87,7 @@ fn main() {
     println!("\n3. Batch proofs — constant 576-byte core regardless of count");
 
     for count in [2, 3, 5] {
-        let keys: Vec<Key> = entries.iter().take(count).map(|(k, _)| *k).collect();
+        let keys: Vec<Key> = entries.iter().take(count).map(|(k, _)| k.clone()).collect();
         let values: Vec<Option<Vec<u8>>> = keys
             .iter()
             .map(|k| get_value(&store, &root_key, k))
@@ -104,9 +106,9 @@ fn main() {
     // ── 4. Mixed batch: inclusion + non-inclusion ───────────────
     println!("\n4. Mixed batch: some keys present, some absent");
 
-    let present_key = entries[2].0;
+    let present_key = entries[2].0.clone();
     let absent_key = make_key(&[0x99, 0x99]);
-    let keys = vec![present_key, absent_key];
+    let keys = vec![present_key.clone(), absent_key.clone()];
     let values: Vec<Option<Vec<u8>>> = keys
         .iter()
         .map(|k| get_value(&store, &root_key, k))
@@ -137,7 +139,7 @@ fn main() {
     let result2 = apply_updates(&store, Some(1), 2, updates);
     let wrong_root = result2.root_commitment;
 
-    let key = entries[0].0;
+    let key = entries[0].0.clone();
     let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
     let value = get_value(&store, &root_key, &key);
 

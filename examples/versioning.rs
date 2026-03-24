@@ -13,7 +13,7 @@ use jellyfish_verkle_tree::{
 };
 
 fn make_key(stem: u8, suffix: u8) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = vec![0u8; 32];
     key[0] = stem;
     key[31] = suffix;
     key
@@ -29,24 +29,24 @@ fn main() {
     let key_a = make_key(0xAA, 0x01);
     let key_b = make_key(0xBB, 0x01);
     let mut updates = BTreeMap::new();
-    updates.insert(key_a, Some(1000u64.to_le_bytes().to_vec()));
-    updates.insert(key_b, Some(500u64.to_le_bytes().to_vec()));
+    updates.insert(key_a.clone(), Some(1000u64.to_le_bytes().to_vec()));
+    updates.insert(key_b.clone(), Some(500u64.to_le_bytes().to_vec()));
     let r = apply_updates(&store, None, 1, updates);
     store.apply(&r);
     println!("v1: Created accounts A=1000, B=500");
 
     // v2: Transfer 200 from A to B
     let mut updates = BTreeMap::new();
-    updates.insert(key_a, Some(800u64.to_le_bytes().to_vec()));
-    updates.insert(key_b, Some(700u64.to_le_bytes().to_vec()));
+    updates.insert(key_a.clone(), Some(800u64.to_le_bytes().to_vec()));
+    updates.insert(key_b.clone(), Some(700u64.to_le_bytes().to_vec()));
     let r = apply_updates(&store, Some(1), 2, updates);
     store.apply(&r);
     println!("v2: Transfer 200 from A→B  (A=800, B=700)");
 
     // v3: Transfer 100 from B to A
     let mut updates = BTreeMap::new();
-    updates.insert(key_a, Some(900u64.to_le_bytes().to_vec()));
-    updates.insert(key_b, Some(600u64.to_le_bytes().to_vec()));
+    updates.insert(key_a.clone(), Some(900u64.to_le_bytes().to_vec()));
+    updates.insert(key_b.clone(), Some(600u64.to_le_bytes().to_vec()));
     let r = apply_updates(&store, Some(2), 3, updates);
     store.apply(&r);
     println!("v3: Transfer 100 from B→A  (A=900, B=600)");
@@ -54,16 +54,16 @@ fn main() {
     // v4: New account C created
     let key_c = make_key(0xCC, 0x01);
     let mut updates = BTreeMap::new();
-    updates.insert(key_c, Some(250u64.to_le_bytes().to_vec()));
+    updates.insert(key_c.clone(), Some(250u64.to_le_bytes().to_vec()));
     let r = apply_updates(&store, Some(3), 4, updates);
     store.apply(&r);
     println!("v4: New account C=250");
 
     // v5: A sends 50 to C, B zeroed out
     let mut updates = BTreeMap::new();
-    updates.insert(key_a, Some(850u64.to_le_bytes().to_vec()));
-    updates.insert(key_b, Some(0u64.to_le_bytes().to_vec())); // zero balance (delete not yet implemented)
-    updates.insert(key_c, Some(300u64.to_le_bytes().to_vec()));
+    updates.insert(key_a.clone(), Some(850u64.to_le_bytes().to_vec()));
+    updates.insert(key_b.clone(), Some(0u64.to_le_bytes().to_vec())); // zero balance (delete not yet implemented)
+    updates.insert(key_c.clone(), Some(300u64.to_le_bytes().to_vec()));
     let r = apply_updates(&store, Some(4), 5, updates);
     store.apply(&r);
     println!("v5: A sends 50 to C, B zeroed  (A=850, B=0, C=300)");

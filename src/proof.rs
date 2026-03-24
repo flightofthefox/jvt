@@ -94,10 +94,10 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<
                 }
             }
             Node::EaS(eas) => {
-                let expected_stem = &key[depth..31];
+                let expected_stem = &key[depth..key_stem_end(key)];
                 if eas.stem == expected_stem {
                     // Inclusion proof (or non-inclusion if value slot is empty)
-                    let suffix = key[31];
+                    let suffix = key_suffix(key);
                     let value = eas.values.get(&suffix).cloned();
                     let is_c2 = suffix >= 128;
                     let sub_commitment = if is_c2 { eas.c2 } else { eas.c1 };
@@ -159,7 +159,7 @@ pub fn verify(
 
     // Verify stem matches
     if proof.inclusion {
-        let expected_stem = &key[proof.depth..31];
+        let expected_stem = &key[proof.depth..key_stem_end(key)];
         if proof.eas_stem != expected_stem {
             return false;
         }
@@ -188,7 +188,7 @@ pub fn prove_batch<S: TreeReader>(
     let mut proofs = Vec::new();
     for key in keys {
         let proof = prove(store, root_key, key)?;
-        proofs.push((*key, proof));
+        proofs.push((key.clone(), proof));
     }
     Some(AggregatedVerkleProof {
         individual_proofs: proofs,
@@ -226,18 +226,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn make_key(first: u8, second: u8, suffix: u8) -> Key {
-        let mut key = [0u8; 32];
+        let mut key = vec![0u8; 32];
         key[0] = first;
         key[1] = second;
         key[31] = suffix;
         key
     }
 
-    fn insert(store: &mut MemoryStore, key: Key, value: Value) {
+    fn insert(store: &mut MemoryStore, key: &Key, value: Value) {
         let parent = store.latest_version();
         let new_version = parent.map_or(1, |v| v + 1);
         let mut updates = BTreeMap::new();
-        updates.insert(key, Some(value));
+        updates.insert(key.clone(), Some(value));
         let result = apply_updates(store, parent, new_version, updates);
         store.apply(&result);
     }
@@ -247,7 +247,7 @@ mod tests {
         let mut store = MemoryStore::new();
         let key = make_key(1, 2, 3);
         let value = vec![42];
-        insert(&mut store, key, value.clone());
+        insert(&mut store, &key, value.clone());
 
         let root_key = store.latest_root_key().unwrap();
         let proof = prove(&store, &root_key, &key).unwrap();
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn prove_nonexistent_key() {
         let mut store = MemoryStore::new();
-        insert(&mut store, make_key(1, 2, 3), vec![42]);
+        insert(&mut store, &make_key(1, 2, 3), vec![42]);
 
         let key2 = make_key(5, 6, 7);
         let root_key = store.latest_root_key().unwrap();
@@ -272,8 +272,8 @@ mod tests {
     #[test]
     fn prove_after_split() {
         let mut store = MemoryStore::new();
-        insert(&mut store, make_key(1, 0, 0), vec![10]);
-        insert(&mut store, make_key(2, 0, 0), vec![20]);
+        insert(&mut store, &make_key(1, 0, 0), vec![10]);
+        insert(&mut store, &make_key(2, 0, 0), vec![20]);
 
         let root_key = store.latest_root_key().unwrap();
 
@@ -293,7 +293,7 @@ mod tests {
         let values: Vec<Value> = (0..5).map(|i| vec![i * 10]).collect();
 
         for (k, v) in keys.iter().zip(values.iter()) {
-            insert(&mut store, *k, v.clone());
+            insert(&mut store, k, v.clone());
         }
 
         let root_key = store.latest_root_key().unwrap();
