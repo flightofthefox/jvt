@@ -1,12 +1,10 @@
 //! Fiat-Shamir transcript for non-interactive proofs.
 //!
-//! Matches the transcript protocol from crate-crypto/rust-verkle and go-ipa.
-//! Uses SHA-256 with append-then-hash-then-clear pattern.
+//! Uses Blake3 with append-then-hash-then-clear pattern.
 
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
-use sha2::{Digest, Sha256};
 
 pub struct Transcript {
     state: Vec<u8>,
@@ -42,13 +40,11 @@ impl Transcript {
     pub fn challenge_scalar(&mut self, label: &[u8]) -> Fr {
         self.domain_sep(label);
 
-        let mut hasher = Sha256::new();
-        hasher.update(&self.state);
-        let hash = hasher.finalize();
+        let hash = blake3::hash(&self.state);
 
         self.state.clear();
 
-        let scalar = Fr::from_le_bytes_mod_order(&hash);
+        let scalar = Fr::from_le_bytes_mod_order(hash.as_bytes());
         self.append_scalar(label, &scalar);
 
         scalar

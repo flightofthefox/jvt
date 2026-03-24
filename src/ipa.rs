@@ -12,7 +12,6 @@
 use ark_ec::CurveGroup;
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, EdwardsProjective, Fr};
 use ark_ff::{AdditiveGroup, BigInteger, Field, PrimeField};
-use sha2::{Digest, Sha256};
 
 use crate::commitment;
 
@@ -34,19 +33,18 @@ pub struct IpaProof {
 impl IpaProof {
     /// Serialized byte size of this proof.
     pub fn byte_size(&self) -> usize {
-        // Each affine point: 32 bytes compressed. Scalar: 32 bytes.
         (self.l_vec.len() + self.r_vec.len()) * 32 + 32
     }
 }
 
 /// Fiat-Shamir transcript for non-interactive proof generation.
 struct Transcript {
-    hasher: Sha256,
+    hasher: blake3::Hasher,
 }
 
 impl Transcript {
     fn new(domain: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(domain);
         Self { hasher }
     }
@@ -67,22 +65,19 @@ impl Transcript {
         self.hasher.update(&val.to_le_bytes());
     }
 
-    /// Generate a challenge scalar from the current transcript state.
     fn challenge(&mut self) -> Fr {
-        let hash = self.hasher.clone().finalize();
-        // Reset hasher with the hash as new state (chain hashing)
-        self.hasher = Sha256::new();
-        self.hasher.update(&hash);
+        let hash = self.hasher.finalize();
+        // Reset hasher with the hash as new state
+        self.hasher = blake3::Hasher::new();
+        self.hasher.update(hash.as_bytes());
         let mut bytes = [0u8; 32];
-        bytes[..31].copy_from_slice(&hash[..31]);
-        bytes[31] = 0; // ensure < field modulus
+        bytes[..31].copy_from_slice(&hash.as_bytes()[..31]);
+        bytes[31] = 0;
         Fr::from_le_bytes_mod_order(&bytes)
     }
 }
 
-/// Get the pre-computed basis points (borrowing from the pedersen module).
 fn get_basis() -> &'static [EdwardsProjective] {
-    // Access the BASIS LazyLock from the pedersen module
     // We expose it through a helper function
     commitment::get_basis()
 }
@@ -133,11 +128,9 @@ pub fn prove(a: &[Fr], commitment: &EdwardsAffine, index: usize) -> (Fr, IpaProo
     // We need a "Q" point for binding the inner product to the commitment.
     // Q is a random group element independent of G_i. We derive it from hashing.
     let q_point = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"JVT_IPA_Q_POINT");
-        let hash = hasher.finalize();
+        let hash = blake3::hash(b"JVT_IPA_Q_POINT");
         let mut bytes = [0u8; 32];
-        bytes[..31].copy_from_slice(&hash[..31]);
+        bytes[..31].copy_from_slice(&hash.as_bytes()[..31]);
         bytes[31] = 0;
         let scalar = Fr::from_le_bytes_mod_order(&bytes);
         basis[0] * scalar // Q = scalar * G_0 (not ideal but sufficient for prototype)
@@ -250,11 +243,9 @@ pub fn verify(
 
     let basis = get_basis();
     let q_point = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"JVT_IPA_Q_POINT");
-        let hash = hasher.finalize();
+        let hash = blake3::hash(b"JVT_IPA_Q_POINT");
         let mut bytes = [0u8; 32];
-        bytes[..31].copy_from_slice(&hash[..31]);
+        bytes[..31].copy_from_slice(&hash.as_bytes()[..31]);
         bytes[31] = 0;
         let scalar = Fr::from_le_bytes_mod_order(&bytes);
         basis[0] * scalar

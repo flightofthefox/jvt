@@ -144,10 +144,9 @@ pub fn value_to_field(value: &[u8]) -> FieldElement {
         bytes[31] = 0; // ensure fits in field
         FieldElement(Fr::from_le_bytes_mod_order(&bytes))
     } else {
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(value);
+        let hash = blake3::hash(value);
         let mut bytes = [0u8; 32];
-        bytes[..31].copy_from_slice(&hash[..31]);
+        bytes[..31].copy_from_slice(&hash.as_bytes()[..31]);
         bytes[31] = 0;
         FieldElement(Fr::from_le_bytes_mod_order(&bytes))
     }
@@ -164,14 +163,13 @@ pub fn int_to_field(v: u64) -> FieldElement {
 /// the Banderwagon "map to scalar" function.
 pub fn commitment_to_field(c: Commitment) -> FieldElement {
     use ark_serialize::CanonicalSerialize;
-    use sha2::{Digest, Sha256};
 
     let mut bytes = Vec::new();
     c.0.serialize_compressed(&mut bytes)
         .expect("serialization should not fail");
-    let hash = Sha256::digest(&bytes);
+    let hash = blake3::hash(&bytes);
     let mut scalar_bytes = [0u8; 32];
-    scalar_bytes[..31].copy_from_slice(&hash[..31]);
+    scalar_bytes[..31].copy_from_slice(&hash.as_bytes()[..31]);
     scalar_bytes[31] = 0;
     FieldElement(Fr::from_le_bytes_mod_order(&scalar_bytes))
 }

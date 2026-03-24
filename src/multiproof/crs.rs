@@ -23,11 +23,8 @@ impl CRS {
     /// NOT a secure setup — for prototype use only.
     pub fn new(n: usize, seed: &[u8]) -> Self {
         use ark_std::rand::SeedableRng;
-        // Hash the seed to get a 32-byte RNG seed
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(seed);
-        let mut rng_seed = [0u8; 32];
-        rng_seed.copy_from_slice(&hash);
+        let hash = blake3::hash(seed);
+        let rng_seed: [u8; 32] = *hash.as_bytes();
         let mut rng = ark_std::rand::rngs::StdRng::from_seed(rng_seed);
 
         let g: Vec<EdwardsProjective> = (0..n).map(|_| EdwardsProjective::rand(&mut rng)).collect();
