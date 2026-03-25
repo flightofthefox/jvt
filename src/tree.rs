@@ -35,7 +35,7 @@ pub struct UpdateResult {
 /// * `parent_version` - The version of the current root (`None` for empty tree)
 /// * `new_version` - The version to stamp on new nodes (must be > parent_version)
 /// * `updates` - Key-value pairs. `Some(value)` = upsert, `None` = reserved for delete.
-pub fn apply_updates<S: TreeReader>(
+pub fn apply_updates<S: TreeReader + Sync>(
     store: &S,
     parent_version: Option<u64>,
     new_version: u64,
@@ -103,7 +103,7 @@ pub fn apply_updates<S: TreeReader>(
 }
 
 /// Get a value from the tree.
-pub fn get_committed_value<S: TreeReader>(
+pub fn get_committed_value<S: TreeReader + Sync>(
     store: &S,
     root_key: &NodeKey,
     key: &Key,
@@ -114,12 +114,12 @@ pub fn get_committed_value<S: TreeReader>(
 
 /// Verify that all commitments in the tree are consistent (recompute from
 /// children/values and compare with stored commitments).
-pub fn verify_commitment_consistency<S: TreeReader>(store: &S, root_key: &NodeKey) -> bool {
+pub fn verify_commitment_consistency<S: TreeReader + Sync>(store: &S, root_key: &NodeKey) -> bool {
     verify_node_commitment(store, root_key)
 }
 
 /// Get the root commitment for a given version.
-pub fn root_commitment_at<S: TreeReader>(store: &S, version: u64) -> Commitment {
+pub fn root_commitment_at<S: TreeReader + Sync>(store: &S, version: u64) -> Commitment {
     match store.get_root_key(version) {
         Some(ref root_key) => match store.get_node(root_key) {
             Some(node) => node.commitment(),
@@ -133,7 +133,12 @@ pub fn root_commitment_at<S: TreeReader>(store: &S, version: u64) -> Commitment 
 // Internal: get
 // ============================================================
 
-fn get_recursive<S: TreeReader>(node: &Node, store: &S, key: &Key, depth: usize) -> Option<Value> {
+fn get_recursive<S: TreeReader + Sync>(
+    node: &Node,
+    store: &S,
+    key: &Key,
+    depth: usize,
+) -> Option<Value> {
     match node {
         Node::EaS(eas) => {
             let expected_stem = &key[depth..SUFFIX_INDEX];
@@ -153,7 +158,7 @@ fn get_recursive<S: TreeReader>(node: &Node, store: &S, key: &Key, depth: usize)
     }
 }
 
-fn verify_node_commitment<S: TreeReader>(store: &S, node_key: &NodeKey) -> bool {
+fn verify_node_commitment<S: TreeReader + Sync>(store: &S, node_key: &NodeKey) -> bool {
     let node = match store.get_node(node_key) {
         Some(n) => n,
         None => return true,
@@ -206,7 +211,7 @@ enum BatchResult {
 }
 
 /// Apply a batch of updates (inserts + deletes) to an existing subtree.
-fn batch_apply_node<S: TreeReader>(
+fn batch_apply_node<S: TreeReader + Sync>(
     store: &S,
     node_key: &NodeKey,
     updates: &[(&Key, &Option<Value>)],
@@ -231,7 +236,7 @@ fn batch_apply_node<S: TreeReader>(
 }
 
 /// Batch apply updates to an internal node.
-fn batch_apply_internal<S: TreeReader>(
+fn batch_apply_internal<S: TreeReader + Sync>(
     store: &S,
     node_key: &NodeKey,
     internal: &InternalNode,
@@ -244,9 +249,20 @@ fn batch_apply_internal<S: TreeReader>(
 
     // Collect child updates/removals first (reads only from `internal`),
     // then clone and mutate only if something changed.
-    let mut child_updates: Vec<(u8, u64, Commitment)> = Vec::new();
-    let mut removals: Vec<u8> = Vec::new();
+    // Partition updates into per-child groups
+    enum ChildGroup<'a> {
+        Existing {
+            child_byte: u8,
+            child_key: NodeKey,
+            group: &'a [(&'a Key, &'a Option<Value>)],
+        },
+        New {
+            child_byte: u8,
+            inserts: Vec<(&'a Key, &'a Value)>,
+        },
+    }
 
+    let mut child_groups: Vec<ChildGroup> = Vec::new();
     let mut i = 0;
     while i < updates.len() {
         let child_byte = updates[i].0[depth];
@@ -258,28 +274,135 @@ fn batch_apply_internal<S: TreeReader>(
         i = j;
 
         if let Some(child) = internal.children.get(&child_byte) {
-            let child_key = node_key.child(child.version, child_byte);
-            match batch_apply_node(store, &child_key, group, depth + 1, version, batch) {
-                BatchResult::Changed(r) => {
-                    child_updates.push((child_byte, version, r.commitment));
-                }
-                BatchResult::Removed => {
-                    removals.push(child_byte);
-                }
-                BatchResult::Unchanged => {}
-            }
+            child_groups.push(ChildGroup::Existing {
+                child_byte,
+                child_key: node_key.child(child.version, child_byte),
+                group,
+            });
         } else {
-            // No existing child — filter to inserts only
             let inserts: Vec<(&Key, &Value)> = group
                 .iter()
                 .filter_map(|&(k, v)| v.as_ref().map(|val| (k, val)))
                 .collect();
             if !inserts.is_empty() {
-                let child_nk = node_key.child(version, child_byte);
-                let r =
-                    batch_create_subtree(&inserts, depth + 1, child_nk.byte_path(), version, batch);
-                child_updates.push((child_byte, version, r.commitment));
+                child_groups.push(ChildGroup::New {
+                    child_byte,
+                    inserts,
+                });
             }
+        }
+    }
+
+    enum ChildOutcome {
+        Changed(u8, Commitment, TreeUpdateBatch),
+        Removed(u8, TreeUpdateBatch),
+        Unchanged,
+    }
+
+    // Process child groups — each is independent, parallelize when enabled.
+    #[cfg(feature = "parallel")]
+    let outcomes: Vec<ChildOutcome> = {
+        use rayon::prelude::*;
+        child_groups
+            .par_iter()
+            .map(|cg| {
+                let mut child_batch = TreeUpdateBatch::default();
+                match cg {
+                    ChildGroup::Existing {
+                        child_byte,
+                        child_key,
+                        group,
+                    } => {
+                        match batch_apply_node(
+                            store,
+                            child_key,
+                            group,
+                            depth + 1,
+                            version,
+                            &mut child_batch,
+                        ) {
+                            BatchResult::Changed(r) => {
+                                ChildOutcome::Changed(*child_byte, r.commitment, child_batch)
+                            }
+                            BatchResult::Removed => ChildOutcome::Removed(*child_byte, child_batch),
+                            BatchResult::Unchanged => ChildOutcome::Unchanged,
+                        }
+                    }
+                    ChildGroup::New {
+                        child_byte,
+                        inserts,
+                    } => {
+                        let child_nk = node_key.child(version, *child_byte);
+                        let r = batch_create_subtree(
+                            inserts,
+                            depth + 1,
+                            child_nk.byte_path(),
+                            version,
+                            &mut child_batch,
+                        );
+                        ChildOutcome::Changed(*child_byte, r.commitment, child_batch)
+                    }
+                }
+            })
+            .collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let outcomes: Vec<ChildOutcome> = child_groups
+        .iter()
+        .map(|cg| {
+            let mut child_batch = TreeUpdateBatch::default();
+            match cg {
+                ChildGroup::Existing {
+                    child_byte,
+                    child_key,
+                    group,
+                } => {
+                    match batch_apply_node(
+                        store,
+                        child_key,
+                        group,
+                        depth + 1,
+                        version,
+                        &mut child_batch,
+                    ) {
+                        BatchResult::Changed(r) => {
+                            ChildOutcome::Changed(*child_byte, r.commitment, child_batch)
+                        }
+                        BatchResult::Removed => ChildOutcome::Removed(*child_byte, child_batch),
+                        BatchResult::Unchanged => ChildOutcome::Unchanged,
+                    }
+                }
+                ChildGroup::New {
+                    child_byte,
+                    inserts,
+                } => {
+                    let child_nk = node_key.child(version, *child_byte);
+                    let r = batch_create_subtree(
+                        inserts,
+                        depth + 1,
+                        child_nk.byte_path(),
+                        version,
+                        &mut child_batch,
+                    );
+                    ChildOutcome::Changed(*child_byte, r.commitment, child_batch)
+                }
+            }
+        })
+        .collect();
+
+    let mut child_updates: Vec<(u8, u64, Commitment)> = Vec::new();
+    let mut removals: Vec<u8> = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            ChildOutcome::Changed(child_byte, commitment, child_batch) => {
+                child_updates.push((child_byte, version, commitment));
+                batch.merge(child_batch);
+            }
+            ChildOutcome::Removed(child_byte, child_batch) => {
+                removals.push(child_byte);
+                batch.merge(child_batch);
+            }
+            ChildOutcome::Unchanged => {}
         }
     }
 
