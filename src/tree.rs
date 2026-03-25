@@ -536,56 +536,181 @@ fn batch_apply_eas(
         });
     }
 
-    // Divergent inserts exist — rebuild the subtree from scratch.
-    // Collect all surviving values (existing + inserts - deletes) as synthetic keys.
-    let mut all_keys_and_values: Vec<(Key, Value)> = Vec::new();
-
-    // Helper: reconstruct a full [u8; 32] key from path + stem + suffix
-    let make_full_key = |path: &[u8], stem: &[u8], suffix: u8| -> Key {
-        let mut full_key = [0u8; 32];
-        full_key[..path.len()].copy_from_slice(path);
-        full_key[path.len()..path.len() + stem.len()].copy_from_slice(stem);
-        full_key[SUFFIX_INDEX] = suffix;
-        full_key
-    };
-
-    // Existing EaS values
-    let delete_set: std::collections::HashSet<u8> = same_stem_deletes.iter().copied().collect();
-    for (&suffix, value) in &eas.values {
-        if !delete_set.contains(&suffix) {
-            let full_key = make_full_key(path, &eas.stem, suffix);
-            all_keys_and_values.push((full_key, *value));
-        }
-    }
-    // Same-stem inserts (override any existing)
-    for &(suffix, value) in &same_stem_inserts {
-        let full_key = make_full_key(path, &eas.stem, suffix);
-        all_keys_and_values.push((full_key, *value));
-    }
-    // Divergent inserts
-    for &(key, value) in &divergent_inserts {
-        all_keys_and_values.push((*key, *value));
-    }
-
-    all_keys_and_values.sort_by(|a, b| a.0.cmp(&b.0));
-    all_keys_and_values.dedup_by(|a, b| {
-        if a.0 == b.0 {
-            std::mem::swap(&mut a.1, &mut b.1);
-            true
-        } else {
-            false
-        }
-    });
-
+    // Divergent inserts exist — incremental split preserving c1/c2.
+    // Instead of flattening all values and rebuilding from scratch (which
+    // recomputes c1/c2 MSMs over all existing values), we apply same-stem
+    // modifications homomorphically and re-stem the existing EaS at the
+    // split point. Only the stem and extension commitments are recomputed.
     batch.mark_stale(node_key.clone(), version);
 
-    if all_keys_and_values.is_empty() {
-        return BatchResult::Removed;
+    if same_stem_inserts.is_empty() && same_stem_deletes.is_empty() {
+        // No same-stem modifications — split directly, no clone needed.
+        let result =
+            split_eas_with_inserts(eas, 0, &divergent_inserts, depth, path, version, batch);
+        return BatchResult::Changed(result);
     }
 
-    let refs: Vec<(&Key, &Value)> = all_keys_and_values.iter().map(|(k, v)| (k, v)).collect();
-    let result = batch_create_subtree(&refs, depth, path, version, batch);
+    // Apply same-stem modifications homomorphically.
+    let mut modified = (*eas).clone();
+    let mods = same_stem_deletes
+        .iter()
+        .map(|&suffix| (suffix, None))
+        .chain(
+            same_stem_inserts
+                .iter()
+                .map(|&(suffix, value)| (suffix, Some(*value))),
+        );
+    modified.batch_update_values(mods);
+
+    if modified.values.is_empty() {
+        // All existing values deleted — build from divergent inserts only.
+        let result = batch_create_subtree(&divergent_inserts, depth, path, version, batch);
+        return BatchResult::Changed(result);
+    }
+
+    let result = split_eas_with_inserts(
+        &modified,
+        0,
+        &divergent_inserts,
+        depth,
+        path,
+        version,
+        batch,
+    );
     BatchResult::Changed(result)
+}
+
+/// Split an existing EaS node with divergent inserts, preserving c1/c2.
+///
+/// Walks down the EaS stem one byte at a time. At each level, divergent keys
+/// that differ at this byte are split off into new subtrees via
+/// `batch_create_subtree`. Keys that share the byte recurse deeper. When no
+/// more divergent keys share the current stem byte, the existing EaS is placed
+/// directly with a trimmed stem — its c1/c2 sub-commitments are preserved,
+/// avoiding expensive MSM recomputation.
+fn split_eas_with_inserts(
+    eas: &EaSNode,
+    stem_offset: usize,
+    divergent_inserts: &[(&Key, &Value)],
+    depth: usize,
+    node_path: &[u8],
+    version: u64,
+    batch: &mut TreeUpdateBatch,
+) -> BatchNodeResult {
+    debug_assert!(!divergent_inserts.is_empty());
+    debug_assert!(stem_offset < eas.stem.len());
+
+    let eas_byte = eas.stem[stem_offset];
+    let parent_nk = NodeKey::new(version, node_path);
+
+    // Group divergent inserts by key[depth] — they're sorted, so groups are contiguous.
+    // Separate the cohabitant group (shares eas_byte) from purely divergent groups.
+    let mut divergent_groups: Vec<(u8, &[(&Key, &Value)])> = Vec::new();
+    let mut cohabitants: Option<&[(&Key, &Value)]> = None;
+
+    let mut i = 0;
+    while i < divergent_inserts.len() {
+        let byte = divergent_inserts[i].0[depth];
+        let mut j = i + 1;
+        while j < divergent_inserts.len() && divergent_inserts[j].0[depth] == byte {
+            j += 1;
+        }
+        let group = &divergent_inserts[i..j];
+
+        if byte == eas_byte {
+            cohabitants = Some(group);
+        } else {
+            divergent_groups.push((byte, group));
+        }
+
+        i = j;
+    }
+
+    // Each work item produces (byte, commitment, batch). The divergent groups
+    // and the EaS slot are independent, so all can run in parallel.
+    enum SplitWork<'a> {
+        /// Divergent group — build subtree from scratch.
+        Divergent(u8, &'a [(&'a Key, &'a Value)]),
+        /// EaS slot with cohabitants — recurse deeper.
+        EasRecurse(&'a [(&'a Key, &'a Value)]),
+        /// EaS slot without cohabitants — place re-stemmed EaS directly.
+        EasPlace,
+    }
+
+    let mut work_items: Vec<SplitWork> = divergent_groups
+        .iter()
+        .map(|&(byte, group)| SplitWork::Divergent(byte, group))
+        .collect();
+
+    match cohabitants {
+        Some(group) => work_items.push(SplitWork::EasRecurse(group)),
+        None => work_items.push(SplitWork::EasPlace),
+    }
+
+    let process_item = |item: &SplitWork| -> (u8, Commitment, TreeUpdateBatch) {
+        let mut child_batch = TreeUpdateBatch::default();
+        match item {
+            SplitWork::Divergent(byte, group) => {
+                let child_nk = parent_nk.child(version, *byte);
+                let result = batch_create_subtree(
+                    group,
+                    depth + 1,
+                    child_nk.byte_path(),
+                    version,
+                    &mut child_batch,
+                );
+                (*byte, result.commitment, child_batch)
+            }
+            SplitWork::EasRecurse(group) => {
+                let child_nk = parent_nk.child(version, eas_byte);
+                let result = split_eas_with_inserts(
+                    eas,
+                    stem_offset + 1,
+                    group,
+                    depth + 1,
+                    child_nk.byte_path(),
+                    version,
+                    &mut child_batch,
+                );
+                (eas_byte, result.commitment, child_batch)
+            }
+            SplitWork::EasPlace => {
+                let trimmed = eas.with_trimmed_stem(stem_offset + 1);
+                let commitment = trimmed.commitment();
+                let eas_child_nk = parent_nk.child(version, eas_byte);
+                child_batch.put_node(eas_child_nk, Node::EaS(Box::new(trimmed)));
+                (eas_byte, commitment, child_batch)
+            }
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    let child_results: Vec<(u8, Commitment, TreeUpdateBatch)> = {
+        use rayon::prelude::*;
+        work_items.par_iter().map(process_item).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let child_results: Vec<(u8, Commitment, TreeUpdateBatch)> =
+        work_items.iter().map(process_item).collect();
+
+    // Batch commitment_to_field for all children (1 inversion instead of N).
+    let child_commitments: Vec<Commitment> = child_results.iter().map(|(_, c, _)| *c).collect();
+    let fields = batch_commitment_to_field(&child_commitments);
+
+    let mut children = HashMap::new();
+    for (i, (byte, commitment, child_batch)) in child_results.into_iter().enumerate() {
+        children.insert(byte, Child::new_with_field(version, commitment, fields[i]));
+        batch.merge(child_batch);
+    }
+
+    let internal = InternalNode::new(children);
+    let commitment = internal.commitment;
+    batch.put_node(parent_nk.clone(), Node::Internal(internal));
+
+    BatchNodeResult {
+        node_key: parent_nk,
+        commitment,
+    }
 }
 
 /// Create a new subtree from scratch for a set of inserts.

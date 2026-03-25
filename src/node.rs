@@ -364,6 +364,30 @@ impl EaSNode {
         }
     }
 
+    /// Create an EaS node with a shorter stem (trimming leading bytes) but the
+    /// same values and sub-commitments. Only recomputes the stem and extension
+    /// commitments. Used during incremental splits to preserve c1/c2.
+    pub fn with_trimmed_stem(&self, bytes_to_trim: usize) -> Self {
+        debug_assert!(bytes_to_trim <= self.stem.len());
+        let new_stem = self.stem[bytes_to_trim..].to_vec();
+        let stem_c = Self::compute_stem_commitment(&new_stem);
+        let extension_commitment = Self::compute_extension_commitment_from_stem_cached(
+            stem_c,
+            new_stem.len(),
+            self.c1_field,
+            self.c2_field,
+        );
+        Self {
+            stem: new_stem,
+            values: self.values.clone(),
+            c1: self.c1,
+            c2: self.c2,
+            c1_field: self.c1_field,
+            c2_field: self.c2_field,
+            extension_commitment,
+        }
+    }
+
     /// Update a single value slot, recomputing commitments.
     pub fn update_value(&mut self, suffix: u8, new_value: Value) {
         self.batch_update_values(std::iter::once((suffix, Some(new_value))));
