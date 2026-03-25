@@ -99,14 +99,37 @@ impl MultiPointProver {
         }
 
         // 3. Compute g(X) = Σ_groups agg_f(X) / (X - z) via barycentric division
-        let mut g_x = vec![Fr::ZERO; n];
-        for (z, agg_f) in grouped_fs.iter().enumerate() {
-            if let Some(agg_f) = agg_f {
+        // Each quotient is independent — parallelize when enabled.
+        let active_groups: Vec<(usize, &Vec<Fr>)> = grouped_fs
+            .iter()
+            .enumerate()
+            .filter_map(|(z, agg_f)| agg_f.as_ref().map(|f| (z, f)))
+            .collect();
+
+        #[cfg(feature = "parallel")]
+        let quotients: Vec<Vec<Fr>> = {
+            use rayon::prelude::*;
+            active_groups
+                .par_iter()
+                .map(|&(z, agg_f)| {
+                    let poly = LagrangeBasis::new(agg_f.clone());
+                    poly.divide_on_domain(precomp, z).values
+                })
+                .collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let quotients: Vec<Vec<Fr>> = active_groups
+            .iter()
+            .map(|&(z, agg_f)| {
                 let poly = LagrangeBasis::new(agg_f.clone());
-                let quotient = poly.divide_on_domain(precomp, z);
-                for (j, val) in quotient.values.iter().enumerate() {
-                    g_x[j] += val;
-                }
+                poly.divide_on_domain(precomp, z).values
+            })
+            .collect();
+
+        let mut g_x = vec![Fr::ZERO; n];
+        for quotient in &quotients {
+            for (j, val) in quotient.iter().enumerate() {
+                g_x[j] += val;
             }
         }
 
