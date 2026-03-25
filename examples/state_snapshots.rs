@@ -8,26 +8,20 @@
 use std::collections::BTreeMap;
 
 use jellyfish_verkle_tree::{
-    apply_updates, get_value, root_commitment_at, verify_commitment_consistency, verkle_proof, Key,
-    MemoryStore, TreeReader,
+    apply_updates, get_committed_value, root_commitment_at, value_to_field,
+    verify_commitment_consistency, verkle_proof, Key, MemoryStore, TreeReader, Value,
 };
 
 /// Encode an address + storage slot into a 32-byte key.
 fn account_key(address: u8, slot: u8) -> Key {
-    let mut key = vec![0u8; 32];
+    let mut key = [0u8; 32];
     key[0] = address;
     key[31] = slot;
     key
 }
 
-fn encode_u64(v: u64) -> Vec<u8> {
-    v.to_le_bytes().to_vec()
-}
-
-fn decode_u64(v: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf[..v.len().min(8)].copy_from_slice(&v[..v.len().min(8)]);
-    u64::from_le_bytes(buf)
+fn encode_u64(v: u64) -> Value {
+    value_to_field(&v.to_le_bytes())
 }
 
 fn main() {
@@ -63,7 +57,7 @@ fn main() {
     println!("  State root: {:?}", r.root_commitment);
 
     // ── Block 2: Alice → Bob transfer ───────────────────────────
-    println!("\nBlock 2 (transfer Alice→Bob 1500):");
+    println!("\nBlock 2 (transfer Alice->Bob 1500):");
     let mut updates = BTreeMap::new();
     updates.insert(account_key(ALICE, BALANCE), Some(encode_u64(8_500)));
     updates.insert(account_key(ALICE, NONCE), Some(encode_u64(1)));
@@ -76,7 +70,7 @@ fn main() {
     println!("  State root: {:?}", r.root_commitment);
 
     // ── Block 3: Bob → Alice transfer + new minting ─────────────
-    println!("\nBlock 3 (Bob→Alice 500, mint 1000 to Bob):");
+    println!("\nBlock 3 (Bob->Alice 500, mint 1000 to Bob):");
     let mut updates = BTreeMap::new();
     updates.insert(account_key(ALICE, BALANCE), Some(encode_u64(9_000)));
     updates.insert(account_key(BOB, BALANCE), Some(encode_u64(7_000)));
@@ -107,45 +101,39 @@ fn main() {
     println!("  State root: {:?}", r.root_commitment);
 
     // ── Auditing: compare state across blocks ───────────────────
-    println!("\n── Audit trail ─────────────────────────────────────");
+    println!("\n-- Audit trail --");
     println!("\nAlice's balance over time:");
     for block in 1..=4 {
         let root_key = store.get_root_key(block).unwrap();
-        let bal = get_value(&store, &root_key, &account_key(ALICE, BALANCE))
-            .map(|v| decode_u64(&v))
-            .unwrap();
-        println!("  Block {block}: {bal}");
+        let val = get_committed_value(&store, &root_key, &account_key(ALICE, BALANCE));
+        println!("  Block {block}: {:?}", val);
     }
 
     println!("\nBob's balance over time:");
     for block in 1..=4 {
         let root_key = store.get_root_key(block).unwrap();
-        let bal = get_value(&store, &root_key, &account_key(BOB, BALANCE))
-            .map(|v| decode_u64(&v))
-            .unwrap();
-        println!("  Block {block}: {bal}");
+        let val = get_committed_value(&store, &root_key, &account_key(BOB, BALANCE));
+        println!("  Block {block}: {:?}", val);
     }
 
     println!("\nTotal supply over time:");
     for block in 1..=4 {
         let root_key = store.get_root_key(block).unwrap();
-        let supply = get_value(&store, &root_key, &account_key(CONTRACT, TOTAL_SUPPLY))
-            .map(|v| decode_u64(&v))
-            .unwrap();
-        println!("  Block {block}: {supply}");
+        let val = get_committed_value(&store, &root_key, &account_key(CONTRACT, TOTAL_SUPPLY));
+        println!("  Block {block}: {:?}", val);
     }
 
     // ── State proof for a light client ──────────────────────────
-    println!("\n── Light client state proof ─────────────────────────");
+    println!("\n-- Light client state proof --");
     println!("A light client wants to verify Alice's balance at block 4.\n");
 
     let root_key = store.get_root_key(4).unwrap();
     let block4_root = root_commitment_at(&store, 4);
     let key = account_key(ALICE, BALANCE);
-    let value = get_value(&store, &root_key, &key);
+    let value = get_committed_value(&store, &root_key, &key);
 
     let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
-    println!("  Claimed value: {}", decode_u64(value.as_ref().unwrap()));
+    println!("  Claimed value: {:?}", value);
     println!("  Proof size: {} bytes", proof.proof_byte_size());
 
     let valid = verkle_proof::verify_single(&proof, block4_root, &key, value.as_ref());
@@ -157,9 +145,9 @@ fn main() {
         account_key(ALICE, BALANCE),
         account_key(CONTRACT, TOTAL_SUPPLY),
     ];
-    let values: Vec<Option<Vec<u8>>> = keys
+    let values: Vec<Option<Value>> = keys
         .iter()
-        .map(|k| get_value(&store, &root_key, k))
+        .map(|k| get_committed_value(&store, &root_key, k))
         .collect();
     let proof = verkle_proof::prove(&store, &root_key, &keys).unwrap();
     let valid = verkle_proof::verify(&proof, block4_root, &keys, &values);
@@ -170,7 +158,7 @@ fn main() {
     println!("  Verification: {valid}");
 
     // ── Pruning for production use ──────────────────────────────
-    println!("\n── Pruning old blocks ──────────────────────────────");
+    println!("\n-- Pruning old blocks --");
     println!(
         "Before: {} nodes, {} stale, versions {:?}",
         store.node_count(),

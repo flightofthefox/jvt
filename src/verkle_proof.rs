@@ -14,9 +14,7 @@ use std::collections::HashMap;
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_ff::AdditiveGroup;
 
-use crate::commitment::{
-    commitment_to_field, field_from_byte, field_one, value_to_field, Commitment,
-};
+use crate::commitment::{commitment_to_field, field_from_byte, field_one, Commitment};
 use crate::multiproof::crs::shared_crs;
 use crate::multiproof::lagrange::{LagrangeBasis, PrecomputedWeights};
 use crate::multiproof::prover::{MultiPointProof, MultiPointProver, ProverQuery, VerifierQuery};
@@ -54,9 +52,9 @@ fn eas_sub_commitment_vector(eas: &EaSNode, is_c2: bool) -> Vec<Fr> {
     let mut v = vec![Fr::ZERO; 256];
     for (&suffix, val) in &eas.values {
         if is_c2 && suffix >= 128 {
-            v[(suffix - 128) as usize] = value_to_field(val).0;
+            v[(suffix - 128) as usize] = val.0;
         } else if !is_c2 && suffix < 128 {
-            v[suffix as usize] = value_to_field(val).0;
+            v[suffix as usize] = val.0;
         }
     }
     v
@@ -130,7 +128,7 @@ fn traverse_for_key<S: TreeReader>(
                 }
             }
             Node::EaS(eas) => {
-                let expected_stem = &key[depth..key_stem_end(key)];
+                let expected_stem = &key[depth..SUFFIX_INDEX];
                 if eas.stem == expected_stem {
                     let suffix = key_suffix(key);
                     let value = eas.values.get(&suffix).cloned();
@@ -166,10 +164,7 @@ fn traverse_for_key<S: TreeReader>(
                     } else {
                         suffix as usize
                     };
-                    let value_scalar = value
-                        .as_ref()
-                        .map(|v| value_to_field(v).0)
-                        .unwrap_or(Fr::ZERO);
+                    let value_scalar = value.map(|v| v.0).unwrap_or(Fr::ZERO);
                     openings.push((sub_commitment.0, sub_vec, sub_index, value_scalar));
 
                     return Some(KeyTraversal {
@@ -259,7 +254,7 @@ impl VerkleProof {
             .iter()
             .map(|kd| {
                 32 + kd.eas_stem.len()
-                    + kd.value.as_ref().map_or(0, |v| v.len())
+                    + kd.value.as_ref().map_or(0, |_| 32)
                     + kd.query_path.len() * 8
                     + 4
             })
@@ -310,7 +305,7 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Opti
         }
 
         key_data.push(KeyProofData {
-            key: key.clone(),
+            key: *key,
             eas_stem: traversal.eas_stem,
             value: traversal.value,
             depth: traversal.depth,
@@ -371,7 +366,7 @@ pub fn verify(
         // Stem check for inclusion
         match &kd.termination {
             TerminationKind::FoundEaS => {
-                let expected_stem = &keys[i][kd.depth..key_stem_end(&keys[i])];
+                let expected_stem = &keys[i][kd.depth..SUFFIX_INDEX];
                 if kd.eas_stem != expected_stem {
                     return false;
                 }
@@ -430,12 +425,8 @@ pub fn verify(
 
         match &kd.termination {
             TerminationKind::FoundEaS => {
-                // Final result must match value_to_field(value)
-                let expected_scalar = kd
-                    .value
-                    .as_ref()
-                    .map(|v| value_to_field(v).0)
-                    .unwrap_or(Fr::ZERO);
+                // Final result must match the committed field element
+                let expected_scalar = kd.value.map(|v| v.0).unwrap_or(Fr::ZERO);
                 if final_result != expected_scalar {
                     return false;
                 }
@@ -534,18 +525,22 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn make_key(first: u8, second: u8, suffix: u8) -> Key {
-        let mut key = vec![0u8; 32];
+        let mut key = [0u8; 32];
         key[0] = first;
         key[1] = second;
-        key[31] = suffix;
+        key[SUFFIX_INDEX] = suffix;
         key
+    }
+
+    fn v(n: u8) -> Value {
+        crate::commitment::value_to_field(&[n])
     }
 
     fn insert(store: &mut MemoryStore, key: &Key, value: Value) {
         let parent = store.latest_version();
         let new_version = parent.map_or(1, |v| v + 1);
         let mut updates = BTreeMap::new();
-        updates.insert(key.clone(), Some(value));
+        updates.insert(*key, Some(value));
         let result = apply_updates(store, parent, new_version, updates);
         store.apply(&result);
     }
@@ -558,8 +553,8 @@ mod tests {
     fn single_key_proof() {
         let mut store = MemoryStore::new();
         let key = make_key(1, 2, 3);
-        let value = vec![42];
-        insert(&mut store, &key, value.clone());
+        let value = v(42);
+        insert(&mut store, &key, value);
 
         let rk = store.latest_root_key().unwrap();
         let proof = prove_single(&store, &rk, &key).unwrap();
@@ -572,23 +567,23 @@ mod tests {
     #[test]
     fn single_key_after_split() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
 
         let rk = store.latest_root_key().unwrap();
         let rc = root_c(&store);
 
         let p1 = prove_single(&store, &rk, &make_key(1, 0, 0)).unwrap();
-        assert!(verify_single(&p1, rc, &make_key(1, 0, 0), Some(&vec![10])));
+        assert!(verify_single(&p1, rc, &make_key(1, 0, 0), Some(&v(10))));
 
         let p2 = prove_single(&store, &rk, &make_key(2, 0, 0)).unwrap();
-        assert!(verify_single(&p2, rc, &make_key(2, 0, 0), Some(&vec![20])));
+        assert!(verify_single(&p2, rc, &make_key(2, 0, 0), Some(&v(20))));
     }
 
     #[test]
     fn nonexistent_stem_mismatch() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 2, 3), vec![42]);
+        insert(&mut store, &make_key(1, 2, 3), v(42));
 
         let rk = store.latest_root_key().unwrap();
         let key2 = make_key(5, 6, 7);
@@ -604,8 +599,8 @@ mod tests {
     #[test]
     fn nonexistent_empty_slot() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
 
         let rk = store.latest_root_key().unwrap();
         // Key with first byte 3 — not in the tree, hits empty child slot
@@ -622,8 +617,8 @@ mod tests {
     #[test]
     fn batch_two_keys() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
 
         let rk = store.latest_root_key().unwrap();
         let keys = [make_key(1, 0, 0), make_key(2, 0, 0)];
@@ -634,7 +629,7 @@ mod tests {
             &proof,
             root_c(&store),
             &keys,
-            &[Some(vec![10]), Some(vec![20])],
+            &[Some(v(10)), Some(v(20))],
         ));
     }
 
@@ -644,7 +639,7 @@ mod tests {
         let keys: Vec<Key> = (0..20u8)
             .map(|i| make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)))
             .collect();
-        let values: Vec<Value> = (0..20u8).map(|i| vec![i]).collect();
+        let values: Vec<Value> = (0..20u8).map(|i| v(i)).collect();
         for (k, v) in keys.iter().zip(values.iter()) {
             insert(&mut store, k, v.clone());
         }
@@ -660,8 +655,8 @@ mod tests {
     #[test]
     fn batch_rejects_wrong_value() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
 
         let rk = store.latest_root_key().unwrap();
         let keys = [make_key(1, 0, 0), make_key(2, 0, 0)];
@@ -671,16 +666,16 @@ mod tests {
             &proof,
             root_c(&store),
             &keys,
-            &[Some(vec![10]), Some(vec![99])],
+            &[Some(v(10)), Some(v(99))],
         ));
     }
 
     #[test]
     fn batch_shared_internal_nodes() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(5, 1, 0), vec![10]);
-        insert(&mut store, &make_key(5, 2, 0), vec![20]);
-        insert(&mut store, &make_key(6, 0, 0), vec![30]);
+        insert(&mut store, &make_key(5, 1, 0), v(10));
+        insert(&mut store, &make_key(5, 2, 0), v(20));
+        insert(&mut store, &make_key(6, 0, 0), v(30));
 
         let rk = store.latest_root_key().unwrap();
         let keys = [make_key(5, 1, 0), make_key(5, 2, 0), make_key(6, 0, 0)];
@@ -690,46 +685,41 @@ mod tests {
             &proof,
             root_c(&store),
             &keys,
-            &[Some(vec![10]), Some(vec![20]), Some(vec![30])],
+            &[Some(v(10)), Some(v(20)), Some(v(30))],
         ));
     }
 
     #[test]
     fn batch_with_nonexistent_key() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
 
         let rk = store.latest_root_key().unwrap();
         let key3 = make_key(1, 99, 0);
         let keys = [make_key(1, 0, 0), key3];
         let proof = prove(&store, &rk, &keys).unwrap();
 
-        assert!(verify(
-            &proof,
-            root_c(&store),
-            &keys,
-            &[Some(vec![10]), None],
-        ));
+        assert!(verify(&proof, root_c(&store), &keys, &[Some(v(10)), None],));
     }
 
     #[test]
     fn chain_catches_wrong_root() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
 
         let rk = store.latest_root_key().unwrap();
         let proof = prove_single(&store, &rk, &make_key(1, 0, 0)).unwrap();
 
-        insert(&mut store, &make_key(3, 0, 0), vec![30]);
+        insert(&mut store, &make_key(3, 0, 0), v(30));
         let new_root = root_c(&store);
 
         assert!(!verify_single(
             &proof,
             new_root,
             &make_key(1, 0, 0),
-            Some(&vec![10])
+            Some(&v(10))
         ));
     }
 }

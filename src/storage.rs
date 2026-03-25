@@ -1,18 +1,17 @@
 //! Storage traits and in-memory backend.
 //!
-//! Three traits define the storage interface:
+//! Two traits define the storage interface:
 //! - `TreeReader` — read nodes and root keys
 //! - `TreeWriter` — write nodes, root keys, and stale entries
-//! - `TreeIterator` — iterate leaves in lexicographic order
 //!
-//! `MemoryStore` implements all three using HashMaps.
+//! `MemoryStore` implements both using HashMaps.
 //! A RocksDB backend would implement `TreeReader`/`TreeWriter` against
-//! column families and `TreeIterator` via prefix scans.
+//! column families.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::node::{key_stem_end, Key, Node, NodeKey, StaleNodeIndex, Value};
+use crate::node::{Node, NodeKey, StaleNodeIndex};
 
 // ============================================================
 // Traits
@@ -29,18 +28,6 @@ pub trait TreeWriter {
     fn put_node(&mut self, key: NodeKey, node: Node);
     fn set_root_key(&mut self, version: u64, key: NodeKey);
     fn record_stale(&mut self, entry: StaleNodeIndex);
-}
-
-/// Leaf iterator. Backends implement this for efficient range scans.
-///
-/// - `MemoryStore`: recursive tree walk
-/// - RocksDB: `seek` to version prefix + `next` through nodes
-pub trait TreeIterator: TreeReader {
-    fn iter_leaves(
-        &self,
-        root_key: &NodeKey,
-        from: Option<&Key>,
-    ) -> Box<dyn Iterator<Item = (Key, Value)> + '_>;
 }
 
 // ============================================================
@@ -134,93 +121,5 @@ impl TreeWriter for MemoryStore {
 
     fn record_stale(&mut self, entry: StaleNodeIndex) {
         self.stale_index.push(entry);
-    }
-}
-
-impl TreeIterator for MemoryStore {
-    fn iter_leaves(
-        &self,
-        root_key: &NodeKey,
-        from: Option<&Key>,
-    ) -> Box<dyn Iterator<Item = (Key, Value)> + '_> {
-        let mut results = Vec::new();
-        collect_leaves(self, root_key, &[], from, &mut results);
-        Box::new(results.into_iter())
-    }
-}
-
-// ============================================================
-// Tree-walk leaf collection (used by MemoryStore::iter_leaves)
-// ============================================================
-
-fn collect_leaves<S: TreeReader>(
-    store: &S,
-    node_key: &NodeKey,
-    path_prefix: &[u8],
-    from: Option<&Key>,
-    results: &mut Vec<(Key, Value)>,
-) {
-    let node = match store.get_node(node_key) {
-        Some(n) => n,
-        None => return,
-    };
-
-    match &*node {
-        Node::Internal(internal) => {
-            let mut child_indices: Vec<u8> = internal.children.keys().copied().collect();
-            child_indices.sort();
-
-            let depth = path_prefix.len();
-            let min_child = from
-                .filter(|from_key| depth < key_stem_end(from_key))
-                .and_then(|from_key| {
-                    if from_key[..depth] == path_prefix[..] {
-                        Some(from_key[depth])
-                    } else {
-                        None
-                    }
-                });
-
-            for &child_idx in &child_indices {
-                if let Some(min) = min_child {
-                    if child_idx < min {
-                        continue;
-                    }
-                }
-
-                let child = &internal.children[&child_idx];
-                let mut child_path = path_prefix.to_vec();
-                child_path.push(child_idx);
-                let child_key = NodeKey::new(child.version, child_path.clone());
-
-                let child_from = if min_child == Some(child_idx) {
-                    from
-                } else {
-                    None
-                };
-                collect_leaves(store, &child_key, &child_path, child_from, results);
-            }
-        }
-        Node::EaS(eas) => {
-            let depth = path_prefix.len();
-            let mut suffix_keys: Vec<u8> = eas.values.keys().copied().collect();
-            suffix_keys.sort();
-
-            for suffix in suffix_keys {
-                let key_len = depth + eas.stem.len() + 1;
-                let mut full_key = vec![0u8; key_len];
-                full_key[..depth].copy_from_slice(path_prefix);
-                full_key[depth..key_len - 1].copy_from_slice(&eas.stem);
-                full_key[key_len - 1] = suffix;
-
-                if let Some(from_key) = from {
-                    if full_key < *from_key {
-                        continue;
-                    }
-                }
-
-                results.push((full_key, eas.values[&suffix].clone()));
-            }
-        }
     }
 }

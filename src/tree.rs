@@ -1,4 +1,4 @@
-//! Core JVT operations: apply_updates, get_value, verify_commitment_consistency.
+//! Core JVT operations: apply_updates, get_committed_value, verify_commitment_consistency.
 //!
 //! All operations are stateless — they take a read-only store reference and
 //! return results without mutations. The caller controls versioning and
@@ -41,11 +41,6 @@ pub fn apply_updates<S: TreeReader>(
     new_version: u64,
     updates: BTreeMap<Key, Option<Value>>,
 ) -> UpdateResult {
-    debug_assert!(
-        updates.keys().all(|k| k.len() >= 2),
-        "all keys must be at least 2 bytes (stem + suffix)"
-    );
-
     let current_root_key: Option<NodeKey> = parent_version
         .and_then(|v| store.get_root_key(v))
         .filter(|rk| store.get_node(rk).is_some());
@@ -108,7 +103,11 @@ pub fn apply_updates<S: TreeReader>(
 }
 
 /// Get a value from the tree.
-pub fn get_value<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<Value> {
+pub fn get_committed_value<S: TreeReader>(
+    store: &S,
+    root_key: &NodeKey,
+    key: &Key,
+) -> Option<Value> {
     let root_node = store.get_node(root_key)?;
     get_recursive(&root_node, store, key, 0)
 }
@@ -137,7 +136,7 @@ pub fn root_commitment_at<S: TreeReader>(store: &S, version: u64) -> Commitment 
 fn get_recursive<S: TreeReader>(node: &Node, store: &S, key: &Key, depth: usize) -> Option<Value> {
     match node {
         Node::EaS(eas) => {
-            let expected_stem = &key[depth..key_stem_end(key)];
+            let expected_stem = &key[depth..SUFFIX_INDEX];
             if eas.stem == expected_stem {
                 eas.values.get(&key_suffix(key)).cloned()
             } else {
@@ -180,7 +179,15 @@ fn verify_node_commitment<S: TreeReader>(store: &S, node_key: &NodeKey) -> bool 
         Node::EaS(eas) => {
             let c1 = EaSNode::compute_c1(&eas.values);
             let c2 = EaSNode::compute_c2(&eas.values);
-            let ext = EaSNode::compute_extension_commitment(&eas.stem, c1, c2);
+            let c1_field = commitment_to_field(c1);
+            let c2_field = commitment_to_field(c2);
+            let stem_c = EaSNode::compute_stem_commitment(&eas.stem);
+            let ext = EaSNode::compute_extension_commitment_from_stem_cached(
+                stem_c,
+                eas.stem.len(),
+                c1_field,
+                c2_field,
+            );
             eas.c1 == c1 && eas.c2 == c2 && eas.extension_commitment == ext
         }
     }
@@ -359,7 +366,7 @@ fn batch_apply_eas(
     let mut divergent_inserts: Vec<(&Key, &Value)> = Vec::new();
 
     for &(key, value) in updates {
-        let expected_stem = &key[depth..key_stem_end(key)];
+        let expected_stem = &key[depth..SUFFIX_INDEX];
         if eas.stem == expected_stem {
             match value {
                 Some(v) => same_stem_inserts.push((key_suffix(key), v)),
@@ -386,7 +393,7 @@ fn batch_apply_eas(
             .chain(
                 same_stem_inserts
                     .iter()
-                    .map(|&(suffix, value)| (suffix, Some(value.clone()))),
+                    .map(|&(suffix, value)| (suffix, Some(*value))),
             );
         new_eas.batch_update_values(updates);
 
@@ -409,26 +416,31 @@ fn batch_apply_eas(
     // Collect all surviving values (existing + inserts - deletes) as synthetic keys.
     let mut all_keys_and_values: Vec<(Key, Value)> = Vec::new();
 
+    // Helper: reconstruct a full [u8; 32] key from path + stem + suffix
+    let make_full_key = |path: &[u8], stem: &[u8], suffix: u8| -> Key {
+        let mut full_key = [0u8; 32];
+        full_key[..path.len()].copy_from_slice(path);
+        full_key[path.len()..path.len() + stem.len()].copy_from_slice(stem);
+        full_key[SUFFIX_INDEX] = suffix;
+        full_key
+    };
+
     // Existing EaS values
     let delete_set: std::collections::HashSet<u8> = same_stem_deletes.iter().copied().collect();
     for (&suffix, value) in &eas.values {
         if !delete_set.contains(&suffix) {
-            let mut full_key = path.to_vec();
-            full_key.extend_from_slice(&eas.stem);
-            full_key.push(suffix);
-            all_keys_and_values.push((full_key, value.clone()));
+            let full_key = make_full_key(path, &eas.stem, suffix);
+            all_keys_and_values.push((full_key, *value));
         }
     }
     // Same-stem inserts (override any existing)
     for &(suffix, value) in &same_stem_inserts {
-        let mut full_key = path.to_vec();
-        full_key.extend_from_slice(&eas.stem);
-        full_key.push(suffix);
-        all_keys_and_values.push((full_key, value.clone()));
+        let full_key = make_full_key(path, &eas.stem, suffix);
+        all_keys_and_values.push((full_key, *value));
     }
     // Divergent inserts
     for &(key, value) in &divergent_inserts {
-        all_keys_and_values.push((key.clone(), value.clone()));
+        all_keys_and_values.push((*key, *value));
     }
 
     all_keys_and_values.sort_by(|a, b| a.0.cmp(&b.0));
@@ -462,16 +474,16 @@ fn batch_create_subtree(
 ) -> BatchNodeResult {
     debug_assert!(!inserts.is_empty());
 
-    let first_stem = &inserts[0].0[depth..key_stem_end(inserts[0].0)];
+    let first_stem = &inserts[0].0[depth..SUFFIX_INDEX];
     let all_same_stem = inserts
         .iter()
-        .all(|(k, _)| k[depth..key_stem_end(k)] == *first_stem);
+        .all(|(k, _)| k[depth..SUFFIX_INDEX] == *first_stem);
 
     if all_same_stem {
         let stem = first_stem.to_vec();
         let mut values = HashMap::new();
         for (key, value) in inserts {
-            values.insert(key_suffix(key), (*value).clone());
+            values.insert(key_suffix(key), *(*value));
         }
         let eas = EaSNode::from_values(stem, values);
         let commitment = eas.commitment();
@@ -524,11 +536,15 @@ mod tests {
     use crate::storage::MemoryStore;
 
     fn make_key(first: u8, second: u8, suffix: u8) -> Key {
-        let mut key = vec![0u8; 32];
+        let mut key = [0u8; 32];
         key[0] = first;
         key[1] = second;
-        key[31] = suffix;
+        key[SUFFIX_INDEX] = suffix;
         key
+    }
+
+    fn v(n: u8) -> Value {
+        value_to_field(&[n])
     }
 
     /// Helper: insert a single key-value into a store, return the result.
@@ -556,15 +572,15 @@ mod tests {
     /// Helper: get a value at the latest version.
     fn get(store: &MemoryStore, key: &Key) -> Option<Value> {
         let root_key = store.latest_root_key()?;
-        get_value(store, &root_key, key)
+        get_committed_value(store, &root_key, key)
     }
 
     #[test]
     fn insert_and_get_single() {
         let mut store = MemoryStore::new();
         let key = make_key(1, 2, 3);
-        insert(&mut store, &key, vec![42]);
-        assert_eq!(get(&store, &key), Some(vec![42]));
+        insert(&mut store, &key, v(42));
+        assert_eq!(get(&store, &key), Some(v(42)));
     }
 
     #[test]
@@ -572,44 +588,44 @@ mod tests {
         let mut store = MemoryStore::new();
         let key1 = make_key(1, 2, 3);
         let key2 = make_key(1, 2, 4);
-        insert(&mut store, &key1, vec![10]);
-        insert(&mut store, &key2, vec![20]);
-        assert_eq!(get(&store, &key1), Some(vec![10]));
-        assert_eq!(get(&store, &key2), Some(vec![20]));
+        insert(&mut store, &key1, v(10));
+        insert(&mut store, &key2, v(20));
+        assert_eq!(get(&store, &key1), Some(v(10)));
+        assert_eq!(get(&store, &key2), Some(v(20)));
     }
 
     #[test]
     fn insert_different_first_byte_triggers_split() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
-        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(vec![10]));
-        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(vec![20]));
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
+        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(v(10)));
+        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(v(20)));
     }
 
     #[test]
     fn insert_shared_prefix_split() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(5, 10, 0), vec![100]);
-        insert(&mut store, &make_key(5, 20, 0), vec![200]);
-        assert_eq!(get(&store, &make_key(5, 10, 0)), Some(vec![100]));
-        assert_eq!(get(&store, &make_key(5, 20, 0)), Some(vec![200]));
+        insert(&mut store, &make_key(5, 10, 0), v(100));
+        insert(&mut store, &make_key(5, 20, 0), v(200));
+        assert_eq!(get(&store, &make_key(5, 10, 0)), Some(v(100)));
+        assert_eq!(get(&store, &make_key(5, 20, 0)), Some(v(200)));
     }
 
     #[test]
     fn update_existing_key() {
         let mut store = MemoryStore::new();
         let key = make_key(1, 2, 3);
-        insert(&mut store, &key, vec![10]);
-        assert_eq!(get(&store, &key), Some(vec![10]));
-        insert(&mut store, &key, vec![20]);
-        assert_eq!(get(&store, &key), Some(vec![20]));
+        insert(&mut store, &key, v(10));
+        assert_eq!(get(&store, &key), Some(v(10)));
+        insert(&mut store, &key, v(20));
+        assert_eq!(get(&store, &key), Some(v(20)));
     }
 
     #[test]
     fn get_nonexistent_key() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 2, 3), vec![42]);
+        insert(&mut store, &make_key(1, 2, 3), v(42));
         assert_eq!(get(&store, &make_key(4, 5, 6)), None);
     }
 
@@ -618,20 +634,20 @@ mod tests {
         let mut store = MemoryStore::new();
         assert_eq!(root_commitment_at(&store, 0), zero_commitment());
 
-        let r1 = insert(&mut store, &make_key(1, 0, 0), vec![10]);
+        let r1 = insert(&mut store, &make_key(1, 0, 0), v(10));
         assert_ne!(r1.root_commitment, zero_commitment());
 
-        let r2 = insert(&mut store, &make_key(2, 0, 0), vec![20]);
+        let r2 = insert(&mut store, &make_key(2, 0, 0), v(20));
         assert_ne!(r2.root_commitment, r1.root_commitment);
     }
 
     #[test]
     fn commitment_consistency_after_operations() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
-        insert(&mut store, &make_key(1, 5, 0), vec![30]);
-        insert(&mut store, &make_key(1, 0, 1), vec![40]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
+        insert(&mut store, &make_key(1, 5, 0), v(30));
+        insert(&mut store, &make_key(1, 0, 1), v(40));
 
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
@@ -642,26 +658,26 @@ mod tests {
         let mut store = MemoryStore::new();
         let key = make_key(1, 2, 3);
 
-        insert(&mut store, &key, vec![10]);
+        insert(&mut store, &key, v(10));
         let v1_root = store.get_root_key(1).unwrap().clone();
 
-        insert(&mut store, &key, vec![20]);
+        insert(&mut store, &key, v(20));
         let v2_root = store.get_root_key(2).unwrap().clone();
 
-        assert_eq!(get_value(&store, &v1_root, &key), Some(vec![10]));
-        assert_eq!(get_value(&store, &v2_root, &key), Some(vec![20]));
+        assert_eq!(get_committed_value(&store, &v1_root, &key), Some(v(10)));
+        assert_eq!(get_committed_value(&store, &v2_root, &key), Some(v(20)));
     }
 
     #[test]
     fn three_way_split() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
-        insert(&mut store, &make_key(3, 0, 0), vec![30]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
+        insert(&mut store, &make_key(3, 0, 0), v(30));
 
-        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(vec![10]));
-        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(vec![20]));
-        assert_eq!(get(&store, &make_key(3, 0, 0)), Some(vec![30]));
+        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(v(10)));
+        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(v(20)));
+        assert_eq!(get(&store, &make_key(3, 0, 0)), Some(v(30)));
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
     }
@@ -673,7 +689,7 @@ mod tests {
             insert(
                 &mut store,
                 &make_key(i, i.wrapping_mul(7), i.wrapping_mul(13)),
-                vec![i],
+                v(i),
             );
         }
         let root = store.latest_root_key().unwrap();
@@ -681,7 +697,7 @@ mod tests {
 
         for i in 0u8..50 {
             let key = make_key(i, i.wrapping_mul(7), i.wrapping_mul(13));
-            assert_eq!(get(&store, &key), Some(vec![i]));
+            assert_eq!(get(&store, &key), Some(v(i)));
         }
     }
 
@@ -691,15 +707,15 @@ mod tests {
         insert_batch(
             &mut store,
             vec![
-                (make_key(1, 0, 0), vec![10]),
-                (make_key(2, 0, 0), vec![20]),
-                (make_key(3, 0, 0), vec![30]),
+                (make_key(1, 0, 0), v(10)),
+                (make_key(2, 0, 0), v(20)),
+                (make_key(3, 0, 0), v(30)),
             ],
         );
 
-        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(vec![10]));
-        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(vec![20]));
-        assert_eq!(get(&store, &make_key(3, 0, 0)), Some(vec![30]));
+        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(v(10)));
+        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(v(20)));
+        assert_eq!(get(&store, &make_key(3, 0, 0)), Some(v(30)));
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
     }
@@ -708,7 +724,7 @@ mod tests {
     fn batch_insert_same_version() {
         let mut store = MemoryStore::new();
         let entries: Vec<(Key, Value)> = (0u8..20)
-            .map(|i| (make_key(i, i.wrapping_mul(3), i.wrapping_mul(7)), vec![i]))
+            .map(|i| (make_key(i, i.wrapping_mul(3), i.wrapping_mul(7)), v(i)))
             .collect();
         insert_batch(&mut store, entries);
 
@@ -716,7 +732,7 @@ mod tests {
 
         for i in 0u8..20 {
             let key = make_key(i, i.wrapping_mul(3), i.wrapping_mul(7));
-            assert_eq!(get(&store, &key), Some(vec![i]));
+            assert_eq!(get(&store, &key), Some(v(i)));
         }
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
@@ -738,8 +754,8 @@ mod tests {
     fn delete_single_key() {
         let mut store = MemoryStore::new();
         let key = make_key(1, 0, 0);
-        insert(&mut store, &key, vec![42]);
-        assert_eq!(get(&store, &key), Some(vec![42]));
+        insert(&mut store, &key, v(42));
+        assert_eq!(get(&store, &key), Some(v(42)));
 
         delete(&mut store, &key);
         assert_eq!(get(&store, &key), None);
@@ -750,13 +766,13 @@ mod tests {
         let mut store = MemoryStore::new();
         let key1 = make_key(1, 0, 0);
         let key2 = make_key(2, 0, 0);
-        insert(&mut store, &key1, vec![10]);
-        insert(&mut store, &key2, vec![20]);
+        insert(&mut store, &key1, v(10));
+        insert(&mut store, &key2, v(20));
 
         delete(&mut store, &key1);
 
         assert_eq!(get(&store, &key1), None);
-        assert_eq!(get(&store, &key2), Some(vec![20]));
+        assert_eq!(get(&store, &key2), Some(v(20)));
 
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
@@ -768,14 +784,14 @@ mod tests {
         // Create an internal node with two EaS children
         let key1 = make_key(1, 0, 0);
         let key2 = make_key(2, 0, 0);
-        insert(&mut store, &key1, vec![10]);
-        insert(&mut store, &key2, vec![20]);
+        insert(&mut store, &key1, v(10));
+        insert(&mut store, &key2, v(20));
 
         // Delete one — should collapse the internal node back to a single EaS
         delete(&mut store, &key1);
 
         // key2 should still work
-        assert_eq!(get(&store, &key2), Some(vec![20]));
+        assert_eq!(get(&store, &key2), Some(v(20)));
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
 
@@ -787,33 +803,33 @@ mod tests {
     #[test]
     fn delete_nonexistent_key_is_noop() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
         let _v_before = store.latest_version();
 
         delete(&mut store, &make_key(99, 0, 0));
 
         // Version still advances (the update was applied), but tree is unchanged
-        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(vec![10]));
+        assert_eq!(get(&store, &make_key(1, 0, 0)), Some(v(10)));
     }
 
     #[test]
     fn delete_same_stem_different_suffix() {
         let mut store = MemoryStore::new();
-        let mut key1 = vec![0u8; 32];
+        let mut key1 = [0u8; 32];
         key1[0] = 1;
-        key1[31] = 10;
-        let mut key2 = vec![0u8; 32];
+        key1[SUFFIX_INDEX] = 10;
+        let mut key2 = [0u8; 32];
         key2[0] = 1;
-        key2[31] = 20;
+        key2[SUFFIX_INDEX] = 20;
 
-        insert(&mut store, &key1, vec![100]);
-        insert(&mut store, &key2, vec![200]);
+        insert(&mut store, &key1, v(100));
+        insert(&mut store, &key2, v(200));
 
         // Delete one suffix, keep the other
         delete(&mut store, &key1);
 
         assert_eq!(get(&store, &key1), None);
-        assert_eq!(get(&store, &key2), Some(vec![200]));
+        assert_eq!(get(&store, &key2), Some(v(200)));
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
     }
@@ -823,8 +839,8 @@ mod tests {
         let mut store = MemoryStore::new();
         let key1 = make_key(1, 0, 0);
         let key2 = make_key(2, 0, 0);
-        insert(&mut store, &key1, vec![10]);
-        insert(&mut store, &key2, vec![20]);
+        insert(&mut store, &key1, v(10));
+        insert(&mut store, &key2, v(20));
 
         delete(&mut store, &key1);
         delete(&mut store, &key2);
@@ -838,12 +854,12 @@ mod tests {
         let mut store = MemoryStore::new();
         let key = make_key(1, 0, 0);
 
-        insert(&mut store, &key, vec![10]);
+        insert(&mut store, &key, v(10));
         delete(&mut store, &key);
         assert_eq!(get(&store, &key), None);
 
-        insert(&mut store, &key, vec![20]);
-        assert_eq!(get(&store, &key), Some(vec![20]));
+        insert(&mut store, &key, v(20));
+        assert_eq!(get(&store, &key), Some(v(20)));
 
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
@@ -852,124 +868,26 @@ mod tests {
     #[test]
     fn batch_insert_and_delete() {
         let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
-        insert(&mut store, &make_key(3, 0, 0), vec![30]);
+        insert(&mut store, &make_key(1, 0, 0), v(10));
+        insert(&mut store, &make_key(2, 0, 0), v(20));
+        insert(&mut store, &make_key(3, 0, 0), v(30));
 
         // Batch: delete key1, update key2, insert key4
         let parent = store.latest_version();
         let new_version = parent.map_or(1, |v| v + 1);
         let mut updates = BTreeMap::new();
         updates.insert(make_key(1, 0, 0), None);
-        updates.insert(make_key(2, 0, 0), Some(vec![99]));
-        updates.insert(make_key(4, 0, 0), Some(vec![40]));
+        updates.insert(make_key(2, 0, 0), Some(v(99)));
+        updates.insert(make_key(4, 0, 0), Some(v(40)));
         let result = apply_updates(&store, parent, new_version, updates);
         store.apply(&result);
 
         assert_eq!(get(&store, &make_key(1, 0, 0)), None);
-        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(vec![99]));
-        assert_eq!(get(&store, &make_key(3, 0, 0)), Some(vec![30]));
-        assert_eq!(get(&store, &make_key(4, 0, 0)), Some(vec![40]));
+        assert_eq!(get(&store, &make_key(2, 0, 0)), Some(v(99)));
+        assert_eq!(get(&store, &make_key(3, 0, 0)), Some(v(30)));
+        assert_eq!(get(&store, &make_key(4, 0, 0)), Some(v(40)));
 
         let root = store.latest_root_key().unwrap();
         assert!(verify_commitment_consistency(&store, &root));
-    }
-
-    // --- Iterator tests ---
-
-    #[test]
-    fn iter_all_leaves() {
-        use crate::storage::TreeIterator;
-
-        let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(3, 0, 0), vec![30]);
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        insert(&mut store, &make_key(2, 0, 0), vec![20]);
-
-        let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
-
-        // Should be sorted lexicographically by key
-        assert_eq!(leaves.len(), 3);
-        assert_eq!(leaves[0].0[0], 1);
-        assert_eq!(leaves[0].1, vec![10]);
-        assert_eq!(leaves[1].0[0], 2);
-        assert_eq!(leaves[1].1, vec![20]);
-        assert_eq!(leaves[2].0[0], 3);
-        assert_eq!(leaves[2].1, vec![30]);
-    }
-
-    #[test]
-    fn iter_from_key() {
-        use crate::storage::TreeIterator;
-
-        let mut store = MemoryStore::new();
-        for i in 0u8..10 {
-            insert(&mut store, &make_key(i, 0, 0), vec![i]);
-        }
-
-        let root = store.latest_root_key().unwrap();
-
-        // From key 5 onwards
-        let from = make_key(5, 0, 0);
-        let leaves: Vec<_> = store.iter_leaves(&root, Some(&from)).collect();
-
-        assert_eq!(leaves.len(), 5); // keys 5, 6, 7, 8, 9
-        assert_eq!(leaves[0].0[0], 5);
-        assert_eq!(leaves[4].0[0], 9);
-    }
-
-    #[test]
-    fn iter_same_stem_multiple_suffixes() {
-        use crate::storage::TreeIterator;
-
-        let mut store = MemoryStore::new();
-        // All same stem, different suffixes
-        for suffix in [3u8, 1, 4, 1, 5, 9, 2, 6] {
-            let mut key = vec![0u8; 32];
-            key[0] = 0xAA;
-            key[31] = suffix;
-            insert(&mut store, &key, vec![suffix]);
-        }
-
-        let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
-
-        // Deduplicated (suffix 1 inserted twice) and sorted by suffix
-        let suffixes: Vec<u8> = leaves.iter().map(|(k, _)| k[31]).collect();
-        assert_eq!(suffixes, vec![1, 2, 3, 4, 5, 6, 9]);
-    }
-
-    #[test]
-    fn iter_empty_tree() {
-        use crate::storage::TreeIterator;
-
-        let mut store = MemoryStore::new();
-        insert(&mut store, &make_key(1, 0, 0), vec![10]);
-        delete(&mut store, &make_key(1, 0, 0));
-
-        let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
-        assert_eq!(leaves.len(), 0);
-    }
-
-    #[test]
-    fn iter_after_deletes() {
-        use crate::storage::TreeIterator;
-
-        let mut store = MemoryStore::new();
-        for i in 0u8..5 {
-            insert(&mut store, &make_key(i, 0, 0), vec![i]);
-        }
-        delete(&mut store, &make_key(1, 0, 0));
-        delete(&mut store, &make_key(3, 0, 0));
-
-        let root = store.latest_root_key().unwrap();
-        let leaves: Vec<_> = store.iter_leaves(&root, None).collect();
-
-        assert_eq!(leaves.len(), 3);
-        assert_eq!(leaves[0].0[0], 0);
-        assert_eq!(leaves[1].0[0], 2);
-        assert_eq!(leaves[2].0[0], 4);
     }
 }

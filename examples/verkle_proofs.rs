@@ -7,10 +7,12 @@
 
 use std::collections::BTreeMap;
 
-use jellyfish_verkle_tree::{apply_updates, get_value, verkle_proof, Key, MemoryStore};
+use jellyfish_verkle_tree::{
+    apply_updates, get_committed_value, value_to_field, verkle_proof, Key, MemoryStore, Value,
+};
 
 fn make_key(prefix: &[u8]) -> Key {
-    let mut key = vec![0u8; 32];
+    let mut key = [0u8; 32];
     for (i, &b) in prefix.iter().enumerate().take(32) {
         key[i] = b;
     }
@@ -21,18 +23,16 @@ fn main() {
     let mut store = MemoryStore::new();
 
     // Populate the tree with varied data
-    let entries: Vec<(Key, Vec<u8>)> = vec![
-        (make_key(&[0x00, 0x11]), b"first".to_vec()),
-        (make_key(&[0x00, 0x22]), b"second".to_vec()),
-        (make_key(&[0x11, 0x00]), b"third".to_vec()),
-        (make_key(&[0x22, 0x33, 0x44]), b"fourth".to_vec()),
-        (make_key(&[0xFF, 0xEE, 0xDD]), b"fifth".to_vec()),
+    let entries: Vec<(Key, Value)> = vec![
+        (make_key(&[0x00, 0x11]), value_to_field(b"first")),
+        (make_key(&[0x00, 0x22]), value_to_field(b"second")),
+        (make_key(&[0x11, 0x00]), value_to_field(b"third")),
+        (make_key(&[0x22, 0x33, 0x44]), value_to_field(b"fourth")),
+        (make_key(&[0xFF, 0xEE, 0xDD]), value_to_field(b"fifth")),
     ];
 
-    let updates: BTreeMap<Key, Option<Vec<u8>>> = entries
-        .iter()
-        .map(|(k, v)| (k.clone(), Some(v.clone())))
-        .collect();
+    let updates: BTreeMap<Key, Option<Value>> =
+        entries.iter().map(|(k, v)| (*k, Some(*v))).collect();
 
     let result = apply_updates(&store, None, 1, updates);
     let root_commitment = result.root_commitment;
@@ -43,15 +43,12 @@ fn main() {
     // ── 1. Single-key inclusion proof ───────────────────────────
     println!("1. Single-key inclusion proof");
 
-    let key = entries[0].0.clone();
+    let key = entries[0].0;
     let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
-    let value = get_value(&store, &root_key, &key);
+    let value = get_committed_value(&store, &root_key, &key);
 
     println!("   Key:   0x{}", hex(&key[..3]));
-    println!(
-        "   Value: {:?}",
-        value.as_ref().map(|v| String::from_utf8_lossy(v))
-    );
+    println!("   Value: {:?}", value);
     println!(
         "   Proof size: {} bytes (core) / {} bytes (total)",
         proof.proof_byte_size(),
@@ -79,18 +76,18 @@ fn main() {
         &proof,
         root_commitment,
         &missing_key,
-        Some(&b"fake".to_vec()),
+        Some(&value_to_field(b"fake")),
     );
     println!("   Tampered (claim value exists): {tampered}");
 
     // ── 3. Batch proof — constant size! ─────────────────────────
-    println!("\n3. Batch proofs — constant 576-byte core regardless of count");
+    println!("\n3. Batch proofs -- constant 576-byte core regardless of count");
 
     for count in [2, 3, 5] {
-        let keys: Vec<Key> = entries.iter().take(count).map(|(k, _)| k.clone()).collect();
-        let values: Vec<Option<Vec<u8>>> = keys
+        let keys: Vec<Key> = entries.iter().take(count).map(|(k, _)| *k).collect();
+        let values: Vec<Option<Value>> = keys
             .iter()
-            .map(|k| get_value(&store, &root_key, k))
+            .map(|k| get_committed_value(&store, &root_key, k))
             .collect();
 
         let proof = verkle_proof::prove(&store, &root_key, &keys).unwrap();
@@ -106,21 +103,15 @@ fn main() {
     // ── 4. Mixed batch: inclusion + non-inclusion ───────────────
     println!("\n4. Mixed batch: some keys present, some absent");
 
-    let present_key = entries[2].0.clone();
+    let present_key = entries[2].0;
     let absent_key = make_key(&[0x99, 0x99]);
-    let keys = vec![present_key.clone(), absent_key.clone()];
-    let values: Vec<Option<Vec<u8>>> = keys
+    let keys = vec![present_key, absent_key];
+    let values: Vec<Option<Value>> = keys
         .iter()
-        .map(|k| get_value(&store, &root_key, k))
+        .map(|k| get_committed_value(&store, &root_key, k))
         .collect();
 
-    println!(
-        "   Key 0x{}: {:?}",
-        hex(&present_key[..2]),
-        values[0]
-            .as_ref()
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-    );
+    println!("   Key 0x{}: {:?}", hex(&present_key[..2]), values[0]);
     println!("   Key 0x{}: {:?}", hex(&absent_key[..2]), values[1]);
 
     let proof = verkle_proof::prove(&store, &root_key, &keys).unwrap();
@@ -135,13 +126,13 @@ fn main() {
 
     // Create a different tree state
     let mut updates = BTreeMap::new();
-    updates.insert(make_key(&[0xFF]), Some(b"extra".to_vec()));
+    updates.insert(make_key(&[0xFF]), Some(value_to_field(b"extra")));
     let result2 = apply_updates(&store, Some(1), 2, updates);
     let wrong_root = result2.root_commitment;
 
-    let key = entries[0].0.clone();
+    let key = entries[0].0;
     let proof = verkle_proof::prove_single(&store, &root_key, &key).unwrap();
-    let value = get_value(&store, &root_key, &key);
+    let value = get_committed_value(&store, &root_key, &key);
 
     let valid_right = verkle_proof::verify_single(&proof, root_commitment, &key, value.as_ref());
     let valid_wrong = verkle_proof::verify_single(&proof, wrong_root, &key, value.as_ref());

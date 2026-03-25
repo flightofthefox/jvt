@@ -9,22 +9,28 @@ use std::collections::HashMap;
 
 use crate::commitment::*;
 
-/// A variable-length key. The last byte is the suffix (EaS value slot index),
-/// all preceding bytes are used for tree traversal and stem.
-/// Minimum length: 2 bytes (1 byte traversal + 1 byte suffix).
-pub type Key = Vec<u8>;
+/// A fixed-size 32-byte key. The last byte (index 31) is the suffix
+/// (EaS value slot index), bytes 0..31 are the stem used for tree
+/// traversal. Callers hash their variable-length keys to 32 bytes
+/// before calling into the JVT.
+pub type Key = [u8; 32];
 
-/// A value stored in the tree.
-pub type Value = Vec<u8>;
+/// A value stored in the tree — a pre-hashed field element.
+/// Callers convert raw bytes to field elements via `value_to_field`
+/// before insertion.
+pub type Value = FieldElement;
 
-/// Key helper: the suffix byte (last byte, selects the EaS value slot).
+/// The fixed index of the suffix byte in a key.
+pub const SUFFIX_INDEX: usize = 31;
+
+/// Key helper: the suffix byte (index 31, selects the EaS value slot).
 pub fn key_suffix(key: &Key) -> u8 {
-    key[key.len() - 1]
+    key[SUFFIX_INDEX]
 }
 
-/// Key helper: the stem end index (everything before the suffix).
-pub fn key_stem_end(key: &Key) -> usize {
-    key.len() - 1
+/// Key helper: the stem (bytes 0..31).
+pub fn key_stem(key: &Key) -> &[u8] {
+    &key[..SUFFIX_INDEX]
 }
 
 /// Node key: uniquely identifies a node in versioned storage.
@@ -74,12 +80,18 @@ impl PartialEq for Child {
 impl Eq for Child {}
 
 impl Child {
-    pub fn new(version: u64, commitment: Commitment) -> Self {
+    /// Create a child with a pre-computed field element (avoids EC inversion).
+    pub fn new_with_field(version: u64, commitment: Commitment, field: FieldElement) -> Self {
         Self {
             version,
             commitment,
-            field: commitment_to_field(commitment),
+            field,
         }
+    }
+
+    /// Create a child, computing `commitment_to_field` (use only for fresh nodes).
+    pub fn new(version: u64, commitment: Commitment) -> Self {
+        Self::new_with_field(version, commitment, commitment_to_field(commitment))
     }
 }
 
@@ -187,7 +199,7 @@ impl EaSNode {
             values
                 .iter()
                 .filter(|(&k, _)| k < 128)
-                .map(|(&k, v)| (k as usize, value_to_field(v))),
+                .map(|(&k, v)| (k as usize, *v)),
         )
     }
 
@@ -197,7 +209,7 @@ impl EaSNode {
             values
                 .iter()
                 .filter(|(&k, _)| k >= 128)
-                .map(|(&k, v)| ((k - 128) as usize, value_to_field(v))),
+                .map(|(&k, v)| ((k - 128) as usize, *v)),
         )
     }
 
@@ -239,27 +251,6 @@ impl EaSNode {
         commit_update(c, stem_len + 2, field_zero(), c2_field)
     }
 
-    /// Compute the extension commitment from a precomputed stem commitment.
-    pub fn compute_extension_commitment_from_stem(
-        stem_commitment: Commitment,
-        stem_len: usize,
-        c1: Commitment,
-        c2: Commitment,
-    ) -> Commitment {
-        Self::compute_extension_commitment_from_stem_cached(
-            stem_commitment,
-            stem_len,
-            commitment_to_field(c1),
-            commitment_to_field(c2),
-        )
-    }
-
-    /// Compute the extension commitment: commit(1, stem[0], ..., stem[n-1], c1, c2).
-    pub fn compute_extension_commitment(stem: &[u8], c1: Commitment, c2: Commitment) -> Commitment {
-        let stem_c = Self::compute_stem_commitment(stem);
-        Self::compute_extension_commitment_from_stem(stem_c, stem.len(), c1, c2)
-    }
-
     /// Update a single value slot, recomputing commitments.
     pub fn update_value(&mut self, suffix: u8, new_value: Value) {
         self.batch_update_values(std::iter::once((suffix, Some(new_value))));
@@ -287,15 +278,8 @@ impl EaSNode {
         let mut c2_proj: EdwardsProjective = self.c2.0.into();
 
         for (suffix, new_value) in updates {
-            let old_field = self
-                .values
-                .get(&suffix)
-                .map(|v| value_to_field(v))
-                .unwrap_or(field_zero());
-            let new_field = new_value
-                .as_ref()
-                .map(|v| value_to_field(v))
-                .unwrap_or(field_zero());
+            let old_field = self.values.get(&suffix).copied().unwrap_or(field_zero());
+            let new_field = new_value.unwrap_or(field_zero());
 
             let delta = new_field.0 - old_field.0;
             if suffix < 128 {
@@ -408,11 +392,15 @@ mod tests {
         assert_eq!(&encoded[9..], &[0xAB, 0xCD, 0xEF]);
     }
 
+    fn v(n: u8) -> Value {
+        value_to_field(&[n])
+    }
+
     #[test]
     fn eas_single_value() {
-        let eas = EaSNode::new_single(vec![1, 2, 3], 42, vec![100]);
+        let eas = EaSNode::new_single(vec![1, 2, 3], 42, v(100));
         assert_eq!(eas.values.len(), 1);
-        assert_eq!(eas.values[&42], vec![100]);
+        assert_eq!(eas.values[&42], v(100));
         // c1 should be nonzero (suffix 42 < 128)
         assert_ne!(eas.c1, zero_commitment());
         // c2 should be zero (no values >= 128)
@@ -421,11 +409,11 @@ mod tests {
 
     #[test]
     fn eas_update_homomorphic() {
-        let mut eas = EaSNode::new_single(vec![1, 2], 10, vec![5]);
+        let mut eas = EaSNode::new_single(vec![1, 2], 10, v(5));
         let original_ext = eas.extension_commitment;
 
         // Update the value
-        eas.update_value(10, vec![20]);
+        eas.update_value(10, v(20));
 
         // Recompute from scratch
         let fresh = EaSNode::from_values(vec![1, 2], eas.values.clone());
@@ -438,10 +426,9 @@ mod tests {
 
     #[test]
     fn internal_node_update_homomorphic() {
-        // Use real commitments from the commit() function
-        let c_a = commit(vec![(0, value_to_field(&[10]))]);
-        let c_b = commit(vec![(1, value_to_field(&[20]))]);
-        let c_c = commit(vec![(2, value_to_field(&[30]))]);
+        let c_a = commit(vec![(0, v(10))]);
+        let c_b = commit(vec![(1, v(20))]);
+        let c_c = commit(vec![(2, v(30))]);
 
         let mut children = HashMap::new();
         children.insert(0, Child::new(1, c_a));

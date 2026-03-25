@@ -5,11 +5,12 @@
 use std::collections::BTreeMap;
 
 use jellyfish_verkle_tree::{
-    apply_updates, get_value, verify_commitment_consistency, Key, MemoryStore,
+    apply_updates, get_committed_value, value_to_field, verify_commitment_consistency, Key,
+    MemoryStore,
 };
 
 fn make_key(bytes: &[u8]) -> Key {
-    let mut key = vec![0u8; 32];
+    let mut key = [0u8; 32];
     for (i, &b) in bytes.iter().enumerate().take(32) {
         key[i] = b;
     }
@@ -24,17 +25,14 @@ fn main() {
 
     let key_alice = make_key(b"alice");
     let mut updates = BTreeMap::new();
-    updates.insert(key_alice.clone(), Some(b"alice's balance: 100".to_vec()));
+    updates.insert(key_alice, Some(value_to_field(b"alice's balance: 100")));
 
     let result = apply_updates(&store, None, 1, updates);
     println!("   Root commitment after v1: {:?}", result.root_commitment);
     store.apply(&result);
 
-    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_alice);
-    println!(
-        "   get(alice) = {:?}",
-        val.as_ref().map(|v| String::from_utf8_lossy(v))
-    );
+    let val = get_committed_value(&store, &store.latest_root_key().unwrap(), &key_alice);
+    println!("   get(alice) = {:?}", val);
 
     // ── 2. Batch insert ─────────────────────────────────────────
     println!("\n2. Batch insert (multiple keys in one version)");
@@ -44,57 +42,51 @@ fn main() {
     let key_dave = make_key(b"dave");
 
     let mut updates = BTreeMap::new();
-    updates.insert(key_bob.clone(), Some(b"bob's balance: 200".to_vec()));
-    updates.insert(key_charlie.clone(), Some(b"charlie's balance: 50".to_vec()));
-    updates.insert(key_dave.clone(), Some(b"dave's balance: 0".to_vec()));
+    updates.insert(key_bob, Some(value_to_field(b"bob's balance: 200")));
+    updates.insert(key_charlie, Some(value_to_field(b"charlie's balance: 50")));
+    updates.insert(key_dave, Some(value_to_field(b"dave's balance: 0")));
 
     let result = apply_updates(&store, Some(1), 2, updates);
     store.apply(&result);
 
     for (name, key) in [
-        ("bob", key_bob.clone()),
-        ("charlie", key_charlie.clone()),
-        ("dave", key_dave.clone()),
+        ("bob", key_bob),
+        ("charlie", key_charlie),
+        ("dave", key_dave),
     ] {
-        let val = get_value(&store, &store.latest_root_key().unwrap(), &key).unwrap();
-        println!("   get({name}) = {}", String::from_utf8_lossy(&val));
+        let val = get_committed_value(&store, &store.latest_root_key().unwrap(), &key).unwrap();
+        println!("   get({name}) = {:?}", val);
     }
 
     // ── 3. Update an existing key ───────────────────────────────
     println!("\n3. Update existing key");
 
     let mut updates = BTreeMap::new();
-    updates.insert(key_alice.clone(), Some(b"alice's balance: 75".to_vec()));
+    updates.insert(key_alice, Some(value_to_field(b"alice's balance: 75")));
 
     let result = apply_updates(&store, Some(2), 3, updates);
     store.apply(&result);
 
-    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_alice).unwrap();
-    println!(
-        "   get(alice) = {} (updated)",
-        String::from_utf8_lossy(&val)
-    );
+    let val = get_committed_value(&store, &store.latest_root_key().unwrap(), &key_alice).unwrap();
+    println!("   get(alice) = {:?} (updated)", val);
 
-    // ── 4. Delete a key (not yet implemented — currently a no-op) ──
+    // ── 4. Delete a key ──────────────────────────────────────────
     println!("\n4. Delete a key");
 
     let mut updates = BTreeMap::new();
-    updates.insert(key_dave.clone(), None); // None = delete
+    updates.insert(key_dave, None); // None = delete
 
     let result = apply_updates(&store, Some(3), 4, updates);
     store.apply(&result);
 
-    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_dave);
-    println!(
-        "   get(dave) = {:?} (expected None)",
-        val.as_ref().map(|v| String::from_utf8_lossy(v))
-    );
+    let val = get_committed_value(&store, &store.latest_root_key().unwrap(), &key_dave);
+    println!("   get(dave) = {:?} (expected None)", val);
 
     // ── 5. Non-existent key ─────────────────────────────────────
     println!("\n5. Non-existent key");
 
     let key_eve = make_key(b"eve");
-    let val = get_value(&store, &store.latest_root_key().unwrap(), &key_eve);
+    let val = get_committed_value(&store, &store.latest_root_key().unwrap(), &key_eve);
     println!("   get(eve) = {:?} (never inserted)", val);
 
     // ── 6. Verify tree integrity ────────────────────────────────

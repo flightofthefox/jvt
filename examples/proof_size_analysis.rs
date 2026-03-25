@@ -5,21 +5,20 @@
 
 use std::collections::BTreeMap;
 
-use jellyfish_verkle_tree::proof;
-use jellyfish_verkle_tree::{apply_updates, Key, MemoryStore};
+use jellyfish_verkle_tree::{apply_updates, value_to_field, verkle_proof, Key, MemoryStore, Value};
 
 fn make_key(i: u32) -> Key {
-    let mut key = vec![0u8; 32];
+    let mut key = [0u8; 32];
     key[0..4].copy_from_slice(&i.to_be_bytes());
     key[31] = (i & 0xFF) as u8;
     key
 }
 
-fn insert(store: &mut MemoryStore, key: &Key, value: Vec<u8>) {
+fn insert(store: &mut MemoryStore, key: &Key, value: Value) {
     let parent = store.latest_version();
     let new_version = parent.map_or(1, |v| v + 1);
     let mut updates = BTreeMap::new();
-    updates.insert(key.clone(), Some(value));
+    updates.insert(*key, Some(value));
     let result = apply_updates(store, parent, new_version, updates);
     store.apply(&result);
 }
@@ -57,21 +56,23 @@ fn main() {
     for &n in &sizes {
         let mut store = MemoryStore::new();
         for i in 0..n {
-            insert(&mut store, &make_key(i), vec![(i & 0xFF) as u8; 32]);
+            insert(
+                &mut store,
+                &make_key(i),
+                value_to_field(&[(i & 0xFF) as u8; 32]),
+            );
         }
 
         let root_key = store.latest_root_key().unwrap();
         let sample_keys: Vec<Key> = (0..n.min(100)).map(make_key).collect();
-        let mut depths = Vec::new();
 
-        for key in &sample_keys {
-            if let Some(p) = proof::prove(&store, &root_key, key) {
-                depths.push(p.commitments.len());
-            }
-        }
+        // Use verkle_proof to get proof info
+        let proof = verkle_proof::prove(&store, &root_key, &sample_keys);
+        let vq_count = proof
+            .as_ref()
+            .map(|p| p.verifier_queries.len())
+            .unwrap_or(0);
 
-        let avg_depth = depths.iter().sum::<usize>() as f64 / depths.len().max(1) as f64;
-        let max_depth = depths.iter().copied().max().unwrap_or(0);
         let jmt_depth = if n > 1 {
             (n as f64).log(16.0).ceil() as usize
         } else {
@@ -80,15 +81,18 @@ fn main() {
 
         println!("Tree: {} keys", n);
         println!(
-            "  JVT depth: avg {:.1}, max {} (256-ary)",
-            avg_depth, max_depth
+            "  JVT: {} verifier queries for {} keys",
+            vq_count,
+            sample_keys.len()
         );
         println!("  JMT depth: ~{} (16-ary)", jmt_depth);
 
-        let jvt_single = max_depth * IPA_PROOF_BYTES + 96;
         let jmt_single = jmt_single_proof_size(jmt_depth);
         println!("  Single-key proof:");
-        println!("    JVT: {} bytes, JMT: {} bytes", jvt_single, jmt_single);
+        println!(
+            "    JVT: {} bytes (constant multiproof), JMT: {} bytes",
+            MULTIPROOF_BYTES, jmt_single
+        );
 
         println!("  Batch proof (multipoint aggregation):");
         for &batch_n in &[10usize, 100, 1000] {
@@ -97,7 +101,7 @@ fn main() {
             }
             let jmt_batch = batch_n * jmt_single;
             println!(
-                "    {} keys: JVT = {} bytes (constant!), JMT = {} bytes ({:.0}×)",
+                "    {} keys: JVT = {} bytes (constant!), JMT = {} bytes ({:.0}x)",
                 batch_n,
                 MULTIPROOF_BYTES,
                 jmt_batch,

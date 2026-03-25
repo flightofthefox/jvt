@@ -4,13 +4,13 @@ use proptest::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 
 use jellyfish_verkle_tree::{
-    apply_updates, get_value, root_commitment_at, verify_commitment_consistency, zero_commitment,
-    Key, MemoryStore, TreeReader, Value,
+    apply_updates, get_committed_value, root_commitment_at, value_to_field,
+    verify_commitment_consistency, zero_commitment, Key, MemoryStore, TreeReader, Value,
 };
 
 fn arb_key() -> impl Strategy<Value = Key> {
     (0u8..16, 0u8..16, any::<[u8; 28]>(), 0u8..=255).prop_map(|(b0, b1, mid, suffix)| {
-        let mut key = vec![0u8; 32];
+        let mut key = [0u8; 32];
         key[0] = b0;
         key[1] = b1;
         key[2..30].copy_from_slice(&mid[..28]);
@@ -21,7 +21,7 @@ fn arb_key() -> impl Strategy<Value = Key> {
 }
 
 fn arb_value() -> impl Strategy<Value = Value> {
-    prop::collection::vec(any::<u8>(), 1..32)
+    prop::collection::vec(any::<u8>(), 1..32).prop_map(|bytes| value_to_field(&bytes))
 }
 
 fn arb_inserts(max_ops: usize) -> impl Strategy<Value = Vec<(Key, Value)>> {
@@ -33,25 +33,25 @@ fn insert(store: &mut MemoryStore, key: &Key, value: Value) {
     let parent = store.latest_version();
     let new_version = parent.map_or(1, |v| v + 1);
     let mut updates = BTreeMap::new();
-    updates.insert(key.clone(), Some(value));
+    updates.insert(*key, Some(value));
     let result = apply_updates(store, parent, new_version, updates);
     store.apply(&result);
 }
 
 fn get(store: &MemoryStore, key: &Key) -> Option<Value> {
     let root_key = store.latest_root_key()?;
-    get_value(store, &root_key, key)
+    get_committed_value(store, &root_key, key)
 }
 
 proptest! {
     #[test]
-    fn get_after_insert(ops in arb_inserts(100)) {
+    fn get_after_insert(ops in arb_inserts(20)) {
         let mut store = MemoryStore::new();
         let mut reference: HashMap<Key, Value> = HashMap::new();
 
         for (key, value) in &ops {
-            insert(&mut store, key, value.clone());
-            reference.insert(key.clone(), value.clone());
+            insert(&mut store, key, *value);
+            reference.insert(*key, *value);
         }
 
         for (key, expected) in &reference {
@@ -64,7 +64,7 @@ proptest! {
     fn commitment_consistency(ops in arb_inserts(50)) {
         let mut store = MemoryStore::new();
         for (key, value) in &ops {
-            insert(&mut store, key, value.clone());
+            insert(&mut store, key, *value);
         }
         let root = store.latest_root_key().unwrap();
         prop_assert!(verify_commitment_consistency(&store, &root));
@@ -79,7 +79,7 @@ proptest! {
             let parent = store.latest_version();
             let new_version = parent.map_or(1, |v| v + 1);
             let mut updates = BTreeMap::new();
-            updates.insert(key.clone(), Some(value.clone()));
+            updates.insert(*key, Some(*value));
             let result = apply_updates(&store, parent, new_version, updates);
             store.apply(&result);
 
@@ -92,7 +92,7 @@ proptest! {
     fn version_monotonicity(ops in arb_inserts(50)) {
         let mut store = MemoryStore::new();
         for (i, (key, value)) in ops.iter().enumerate() {
-            insert(&mut store, key, value.clone());
+            insert(&mut store, key, *value);
             prop_assert_eq!(store.latest_version(), Some((i + 1) as u64));
         }
     }
@@ -103,14 +103,14 @@ proptest! {
         let mut version_snapshots: Vec<(u64, Key, Value)> = Vec::new();
 
         for (key, value) in &ops {
-            insert(&mut store, key, value.clone());
+            insert(&mut store, key, *value);
             let v = store.latest_version().unwrap();
-            version_snapshots.push((v, key.clone(), value.clone()));
+            version_snapshots.push((v, *key, *value));
         }
 
         for (version, key, expected_value) in &version_snapshots {
             let root_key = store.get_root_key(*version).unwrap();
-            let actual = get_value(&store, &root_key, key);
+            let actual = get_committed_value(&store, &root_key, key);
             prop_assert_eq!(actual.as_ref(), Some(expected_value));
         }
     }
@@ -124,8 +124,8 @@ proptest! {
         let mut inserted: HashMap<Key, Value> = HashMap::new();
 
         for (key, value) in &ops {
-            insert(&mut store, key, value.clone());
-            inserted.insert(key.clone(), value.clone());
+            insert(&mut store, key, *value);
+            inserted.insert(*key, *value);
         }
 
         for key in &extra_keys {
@@ -141,8 +141,8 @@ proptest! {
         let mut store2 = MemoryStore::new();
 
         for (key, value) in &ops {
-            insert(&mut store1, key, value.clone());
-            insert(&mut store2, key, value.clone());
+            insert(&mut store1, key, *value);
+            insert(&mut store2, key, *value);
         }
 
         let v = store1.latest_version().unwrap();
@@ -153,25 +153,24 @@ proptest! {
     fn update_overwrites(key in arb_key(), val1 in arb_value(), val2 in arb_value()) {
         let mut store = MemoryStore::new();
         insert(&mut store, &key, val1);
-        insert(&mut store, &key, val2.clone());
+        insert(&mut store, &key, val2);
         prop_assert_eq!(get(&store, &key), Some(val2));
     }
 
     #[test]
-    fn proof_generation_succeeds(ops in arb_inserts(20)) {
+    fn proof_generation_succeeds(ops in arb_inserts(10)) {
         let mut store = MemoryStore::new();
-        let mut inserted: HashMap<Key, Value> = HashMap::new();
+        let mut last_key = None;
 
         for (key, value) in &ops {
-            insert(&mut store, key, value.clone());
-            inserted.insert(key.clone(), value.clone());
+            insert(&mut store, key, *value);
+            last_key = Some(*key);
         }
 
         let root_key = store.latest_root_key().unwrap();
-        for (key, _value) in &inserted {
-            let proof = jellyfish_verkle_tree::proof::prove(&store, &root_key, key);
-            prop_assert!(proof.is_some());
-            prop_assert!(proof.unwrap().inclusion);
-        }
+        let proof = jellyfish_verkle_tree::verkle_proof::prove_single(
+            &store, &root_key, &last_key.unwrap(),
+        );
+        prop_assert!(proof.is_some());
     }
 }

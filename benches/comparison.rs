@@ -3,24 +3,29 @@
 use std::collections::BTreeMap;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use jellyfish_verkle_tree::proof;
+use jellyfish_verkle_tree::verkle_proof;
 use jellyfish_verkle_tree::{
-    apply_updates, get_value, root_commitment_at, verify_commitment_consistency, Key, MemoryStore,
+    apply_updates, get_committed_value, root_commitment_at, value_to_field,
+    verify_commitment_consistency, Key, MemoryStore, Value,
 };
 use std::hint::black_box;
 
 fn make_key(i: u32) -> Key {
-    let mut key = vec![0u8; 32];
+    let mut key = [0u8; 32];
     key[0..4].copy_from_slice(&i.to_be_bytes());
     key[31] = (i & 0xFF) as u8;
     key
 }
 
-fn insert(store: &mut MemoryStore, key: &Key, value: Vec<u8>) {
+fn v(bytes: &[u8]) -> Value {
+    value_to_field(bytes)
+}
+
+fn insert(store: &mut MemoryStore, key: &Key, value: Value) {
     let parent = store.latest_version();
     let new_version = parent.map_or(1, |v| v + 1);
     let mut updates = BTreeMap::new();
-    updates.insert(key.clone(), Some(value));
+    updates.insert(*key, Some(value));
     let result = apply_updates(store, parent, new_version, updates);
     store.apply(&result);
 }
@@ -28,7 +33,7 @@ fn insert(store: &mut MemoryStore, key: &Key, value: Vec<u8>) {
 fn build_store(n: u32) -> MemoryStore {
     let mut store = MemoryStore::new();
     for i in 0..n {
-        insert(&mut store, &make_key(i), vec![(i & 0xFF) as u8; 32]);
+        insert(&mut store, &make_key(i), v(&[(i & 0xFF) as u8; 32]));
     }
     store
 }
@@ -41,7 +46,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
             b.iter(|| {
                 let mut store = MemoryStore::new();
                 for i in 0..n {
-                    insert(&mut store, &make_key(i), vec![(i & 0xFF) as u8; 32]);
+                    insert(&mut store, &make_key(i), v(&[(i & 0xFF) as u8; 32]));
                 }
                 black_box(root_commitment_at(&store, store.latest_version().unwrap()));
             });
@@ -55,7 +60,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
             b.iter_batched(
                 || store.clone(),
                 |mut s| {
-                    insert(&mut s, &new_key, vec![42; 32]);
+                    insert(&mut s, &new_key, v(&[42; 32]));
                     black_box(());
                 },
                 criterion::BatchSize::SmallInput,
@@ -66,8 +71,8 @@ fn bench_insert_throughput(c: &mut Criterion) {
     // Batch insert: single apply_updates call with many keys into an existing tree
     for &batch_n in &[10, 100] {
         let store = build_store(1000);
-        let updates: BTreeMap<Key, Option<Vec<u8>>> = (0..batch_n)
-            .map(|i| (make_key(10_000 + i), Some(vec![(i & 0xFF) as u8; 32])))
+        let updates: BTreeMap<Key, Option<Value>> = (0..batch_n)
+            .map(|i| (make_key(10_000 + i), Some(v(&[(i & 0xFF) as u8; 32]))))
             .collect();
         group.bench_with_input(
             BenchmarkId::new("batch_into_existing", batch_n),
@@ -100,7 +105,7 @@ fn bench_get_throughput(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("all_keys", n), &n, |b, &n| {
             b.iter(|| {
                 for i in 0..n {
-                    black_box(get_value(&store, &root_key, &make_key(i)));
+                    black_box(get_committed_value(&store, &root_key, &make_key(i)));
                 }
             });
         });
@@ -108,7 +113,7 @@ fn bench_get_throughput(c: &mut Criterion) {
         let mid_key = make_key(n / 2);
         group.bench_with_input(BenchmarkId::new("single_key", n), &n, |b, _| {
             b.iter(|| {
-                black_box(get_value(&store, &root_key, &mid_key));
+                black_box(get_committed_value(&store, &root_key, &mid_key));
             });
         });
     }
@@ -126,7 +131,7 @@ fn bench_commitment_update(c: &mut Criterion) {
             b.iter_batched(
                 || store.clone(),
                 |mut s| {
-                    insert(&mut s, &key, vec![99; 32]);
+                    insert(&mut s, &key, v(&[99; 32]));
                     black_box(());
                 },
                 criterion::BatchSize::SmallInput,
@@ -147,7 +152,7 @@ fn bench_proof_generation(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("single_key", n), &n, |b, _| {
             b.iter(|| {
-                black_box(proof::prove(&store, &root_key, &key));
+                black_box(verkle_proof::prove_single(&store, &root_key, &key));
             });
         });
     }
@@ -159,7 +164,7 @@ fn bench_proof_generation(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("batch", batch_n), &batch_n, |b, _| {
             b.iter(|| {
-                black_box(proof::prove_batch(&store, &root_key, &keys));
+                black_box(verkle_proof::prove(&store, &root_key, &keys));
             });
         });
     }

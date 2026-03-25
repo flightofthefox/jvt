@@ -7,23 +7,23 @@
 //!
 //! All operations are stateless:
 //! - `apply_updates(store, parent_version, new_version, updates) -> UpdateResult`
-//! - `get_value(store, root_key, key) -> Option<Value>`
+//! - `get_committed_value(store, root_key, key) -> Option<Value>`
 //! - `verify_commitment_consistency(store, root_key) -> bool`
 
 pub mod commitment;
 pub mod multiproof;
 pub mod node;
-pub mod proof;
 pub mod storage;
 pub mod tree;
 pub mod verkle_proof;
 
 // Core types
-pub use commitment::{zero_commitment, Commitment, FieldElement};
+pub use commitment::{value_to_field, zero_commitment, Commitment, FieldElement};
 pub use node::{
     Child, EaSNode, InternalNode, Key, Node, NodeKey, StaleNodeIndex, TreeUpdateBatch, Value,
 };
-pub use storage::{MemoryStore, TreeIterator, TreeReader, TreeWriter};
+pub use storage::{MemoryStore, TreeReader, TreeWriter};
 pub use tree::{
-    apply_updates, get_value, root_commitment_at, verify_commitment_consistency, UpdateResult,
+    apply_updates, get_committed_value, root_commitment_at, verify_commitment_consistency,
+    UpdateResult,
 };
