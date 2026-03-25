@@ -5,6 +5,9 @@
 // the homomorphic property:
 //
 //   commitUpdate(commit(vs), i, vs[i], v') == commit(vs.set(i, v'))
+//
+// Also models commitment_to_field (EC point → field element) as a
+// bijective map, enabling abstract proof chain verification.
 
 module commitment {
     // A commitment is modeled as an opaque integer.
@@ -23,11 +26,18 @@ module commitment {
     }
 
     // Homomorphic update: C_new = C_old + (new_value - old_value) * basis(index)
+    // Uses double-mod to handle negative deltas safely.
     pure def commitUpdate(oldC: Commitment, index: int, oldVal: int, newVal: int): Commitment = {
-        (oldC + (newVal - oldVal) * basis(index)) % MODULUS
+        ((oldC + (newVal - oldVal) * basis(index)) % MODULUS + MODULUS) % MODULUS
     }
 
     pure val ZERO_COMMITMENT: Commitment = 0
 
     pure def valueToField(v: int): int = v % MODULUS
+
+    // Maps a commitment to a field element, modeling commitment_to_field
+    // in the Rust implementation (EC affine point → x-coordinate).
+    // Uses a bijection mod MODULUS: c ↦ (c * 31337 + 42) mod p.
+    // Bijective since gcd(31337, 104729) = 1.
+    pure def commitmentToField(c: Commitment): int = (c * 31337 + 42) % MODULUS
 }
