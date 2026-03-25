@@ -68,10 +68,7 @@ fn main() {
 
         // Use verkle_proof to get proof info
         let proof = verkle_proof::prove(&store, &root_key, &sample_keys);
-        let vq_count = proof
-            .as_ref()
-            .map(|p| p.verifier_queries.len())
-            .unwrap_or(0);
+        let commit_count = proof.as_ref().map(|p| p.num_commitments()).unwrap_or(0);
 
         let jmt_depth = if n > 1 {
             (n as f64).log(16.0).ceil() as usize
@@ -80,9 +77,11 @@ fn main() {
         };
 
         println!("Tree: {} keys", n);
+        let total_size = proof.as_ref().map(|p| p.total_byte_size()).unwrap_or(0);
         println!(
-            "  JVT: {} verifier queries for {} keys",
-            vq_count,
+            "  JVT: {} unique commitments, {} total bytes for {} keys",
+            commit_count,
+            total_size,
             sample_keys.len()
         );
         println!("  JMT depth: ~{} (16-ary)", jmt_depth);

@@ -208,9 +208,8 @@ fn single_key_tree() {
     let rk = store.latest_root_key().unwrap();
     let proof = verkle_proof::prove_single(&store, &rk, &make_key(42, 0, 0)).unwrap();
 
-    // Root is an EaS — no internal nodes, but EaS openings exist
-    // (marker byte, extension → c1/c2, c1/c2 → value)
-    assert_eq!(proof.verifier_queries.len(), 3);
+    // Root is an EaS — no internal nodes, path = [extension, sub] = 2 commitments
+    assert_eq!(proof.key_data[0].commitment_path.len(), 2);
     assert!(verkle_proof::verify_single(
         &proof,
         root_c(&store),
