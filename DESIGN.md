@@ -305,94 +305,96 @@ fn get(key, version):
 
 **Complexity:** O(log₂₅₆ n) node reads. With 256-ary branching, a tree with 10⁹ entries has at most ~4 levels, so this is 4 reads in practice.
 
-### 5.3 `prove(key: [u8; 32], version: u64) -> VerkleProof`
+### 5.3 `prove(keys: &[Key], version: u64) -> VerkleProof`
 
-Generate a proof of inclusion (or non-inclusion) for a single key.
+Generate an aggregated proof of inclusion (or non-inclusion) for one or more keys. A single function handles both single-key and batch proofs — there is no separate `prove_single` vs `prove_batch`; the multipoint scheme handles any number of keys uniformly.
 
-**Proof structure:**
+**Proof structure (compact wire format):**
 
 ```
 VerkleProof {
-    // For each level traversed (root to EaS):
-    commitments: Vec<Commitment>,       // The commitment at each internal node
-    opening_proofs: Vec<OpeningProof>,   // IPA proof that child_commitment is at index i
+    multipoint_proof: MultiPointProof,   // Constant 576 bytes (D commitment + IPA proof)
+    commitments: Vec<Commitment>,        // Deduplicated commitment table (~32B each)
+    key_data: Vec<KeyProofData>,         // Per-key metadata
+}
 
-    // At the EaS level:
-    eas_stem: Vec<u8>,
-    eas_proof: EaSOpeningProof,         // Proof that (stem, c1, c2) are committed
-    value_proof: OpeningProof,          // Proof that value is at the correct index in c1 or c2
-
-    // The value itself (or absence marker)
-    value: Option<Vec<u8>>,
+KeyProofData {
+    key: Key,                            // The 32-byte key
+    value: Option<Value>,                // The value (or None for non-inclusion)
+    depth: u8,                           // Tree depth of the EaS or failing internal node
+    commitment_path: Vec<u16>,           // Indices into commitments[] along the path
+    termination: TerminationKind,        // How the lookup terminated
 }
 ```
 
-**For each internal node on the path:** Generate an IPA opening proof showing that the child's commitment at index `path[depth]` is correctly committed within the parent's vector commitment.
+The `commitment_path` layout depends on the termination kind:
+- `FoundEaS`: `[internal_0, .., internal_{d-1}, extension, sub_commitment]` — `d + 2` entries
+- `EmptySlot`: `[internal_0, .., internal_d]` — `d + 1` entries
+- `StemMismatch`: `[internal_0, .., internal_{d-1}, extension]` — `d + 1` entries
 
-**For the EaS node:** Generate proofs that:
-1. The extension commitment correctly contains (1, stem, c1, c2)
-2. The value is correctly committed within c1 (if suffix < 128) or c2 (if suffix ≥ 128)
+**Key design choice:** The proof does not store explicit `(C, z, y)` opening triples. Instead, the verifier **reconstructs** them from the commitment table and per-key metadata:
+- Evaluation points (`z`) are derived from the key bytes (child indices) and stem/suffix structure
+- Results (`y`) are derived via `commitment_to_field(next_commitment)` along the chain, with known terminal values (field element 1 for the EaS marker, 0 for empty slots, the value scalar for leaves)
+- Only `StemMismatch` non-inclusion proofs carry an explicit byte (`actual_stem_byte`) that the verifier cannot derive
+
+This compact representation reduces total proof size by ~60% compared to transmitting raw triples.
 
 **Non-inclusion proof:** If the key doesn't exist, the proof terminates at either:
-- An empty child slot in an internal node (prove the slot is empty)
-- An EaS node with a different stem (prove the stem doesn't match)
+- An empty child slot in an internal node (the opening result is zero)
+- An EaS node with a different stem (the opened stem byte differs from the key's)
 
-### 5.4 `prove_batch(keys: Vec<[u8; 32]>, version: u64) -> AggregatedVerkleProof`
+**Openings per key:**
+- Per internal node traversed: 1 opening (child commitment at key byte index)
+- At the EaS: 3 openings (marker byte = 1, extension → c1/c2, c1/c2 → value)
+- For StemMismatch: 1–2 openings (marker + optional divergent stem byte)
 
-Generate an aggregated proof for multiple keys. This is the killer feature of verkle trees.
+Openings are deduplicated across keys: two keys traversing the same internal node at the same child index share a single opening.
 
-**Algorithm (conceptual):**
+### 5.4 Multipoint Aggregation
 
-1. For each key, collect the individual opening proofs (as in `prove`)
-2. Group all opening proofs by their commitment (many keys may traverse the same internal node)
-3. Use the **multipoint argument** (Dankrad Feist's scheme) to compress all opening proofs into a single ~200-byte proof
+All openings across all keys are compressed into a single 576-byte `MultiPointProof` using the Dankrad Feist multipoint scheme:
 
-**Multipoint aggregation sketch:**
-- Verifier sends random challenge `r`
-- All openings `(C_i, z_i, y_i)` (commitment, evaluation point, claimed value) are combined:
-  - `g(X) = Σ r^i · (f_i(X) - y_i) / (X - z_i)` — the aggregated quotient
-- A single IPA proof for `g` suffices to verify all openings
+1. Fiat-Shamir challenge `r` aggregates all openings via random linear combination
+2. Polynomials grouped by evaluation point, combined into quotient `g(X)`
+3. Challenge `t` (outside domain) produces `h(X) = Σ agg_f(X) / (t - z)`
+4. Single IPA proof for `h(X) - g(X)` at point `t`
+5. Verifier reconstructs `E` via MSM over commitments, checks single IPA
 
-**Implementation status:** Fully implemented following the crate-crypto/go-ipa and crate-crypto/rust-verkle reference implementations. Uses Blake3-based Fiat-Shamir transcripts. Produces a 576-byte constant-size proof. See `src/multiproof/prover.rs` for the implementation and `src/verkle_proof.rs` for tree-level integration.
+**Implementation:** Fully implemented following the crate-crypto/go-ipa and crate-crypto/rust-verkle reference implementations. Uses Blake3-based Fiat-Shamir transcripts. See `src/multiproof/prover.rs` for the IPA and multipoint implementation, `src/verkle_proof.rs` for tree-level proof generation and query reconstruction.
 
-### 5.5 `verify(proof: VerkleProof, root: RootCommitment, key, value) -> bool`
+### 5.5 `verify(proof: VerkleProof, root: Commitment, keys, values) -> bool`
 
-Verify a single-key proof against a root commitment.
+Verify an aggregated proof against a root commitment.
 
 ```
-fn verify(proof, root, key, value):
-    path = key[0..31]
-    suffix = key[31]
+fn verify(proof, root, keys, expected_values):
+    // 1. Semantic checks
+    for each (key, key_data, expected_value):
+        // Root check: first commitment in path must match root
+        assert commitments[key_data.commitment_path[0]] == root
 
-    // Verify each level's opening proof
-    current_commitment = root
-    for depth in 0..proof.commitments.len():
-        child_index = path[depth]
-        if !verify_opening(
-            current_commitment,
-            child_index,
-            proof.commitments[depth],
-            proof.opening_proofs[depth]
-        ):
-            return false
-        current_commitment = proof.commitments[depth]
+        // Value check
+        assert key_data.value == expected_value
 
-    // Verify the EaS opening
-    if !verify_eas_opening(current_commitment, proof.eas_stem, proof.eas_proof):
-        return false
+        // Path length check (depends on termination kind)
+        // StemMismatch: actual_stem_byte must differ from key's byte
 
-    // Verify the value within the EaS
-    sub_commitment = if suffix < 128 { proof.c1 } else { proof.c2 }
-    sub_index = if suffix < 128 { suffix } else { suffix - 128 }
-    if !verify_opening(sub_commitment, sub_index, value_to_field(value), proof.value_proof):
-        return false
+    // 2. Reconstruct verifier queries from compact proof data
+    queries = []
+    seen = {}
+    for each key_data in proof.key_data:
+        // Walk commitment_path, derive (C, z, y) triples:
+        //   - Internal nodes: z = key[depth], y = commitment_to_field(next_commitment)
+        //   - EaS marker: z = 0, y = 1
+        //   - Extension → sub: z = stem_len + 1/2, y = commitment_to_field(sub_commitment)
+        //   - Value: z = suffix_index, y = value_scalar
+        // Deduplicate by (commitment, eval_point) — same order as prover
 
-    return true
+    // 3. Cryptographic verification: single multipoint check
+    return proof.multipoint_proof.check(queries)
 ```
 
-### 5.6 `verify_batch(proof: AggregatedVerkleProof, root, keys, values) -> bool`
-
-Verify an aggregated multipoint proof. The verifier reconstructs `E = Σ C_i · (r^i / (t - z_i))` via MSM, computes `g_2(t) = Σ r^i · y_i / (t - z_i)`, and verifies a single IPA proof for `(E - D)` at point `t`. See `src/verkle_proof.rs::verify_aggregated`.
+The chain verification from the old format is now implicit: if any commitment in the path is wrong, the reconstructed `(C, z, y)` triples won't match the multipoint proof, and the IPA check fails.
 
 ---
 
@@ -538,44 +540,54 @@ fn batch_insert(updates: Vec<(Key, Value)>, version: u64):
 
 ## 7. Proof Size Analysis
 
-### 7.1 Single-Key Proof (Measured)
+### 7.1 Proof Components
 
-Each internal node level requires one IPA proof (Bulletproofs-style, 8 rounds for 256 elements):
+A `VerkleProof` has three components:
 
-| Component | JMT (Merkle) | JVT (Verkle) |
-|-----------|--------------|--------------|
-| Per internal level | 15 sibling hashes × 32B = 480B | 1 IPA proof = 544B |
-| Levels (10⁹ entries) | ~8 (nibble-based) | ~4 (byte-based) |
-| Leaf/EaS proof | 1 hash = 32B | ~96B (stem + c1/c2 openings) |
-| **Total single proof** | **~3,904B** | **~2,272B** |
+| Component | Size | Scaling |
+|-----------|------|---------|
+| **Multipoint proof** | 576 B | Constant (1 point D + 8-round IPA) |
+| **Commitment table** | N × 32 B | ~3–4 unique commitments per key (deduplicated across shared internal nodes) |
+| **Per-key metadata** | ~70 B/key | Key (32B) + value (0–33B) + depth (1B) + commitment path (~4–8B) + termination (1–3B) |
 
-For single-key proofs, JVT's IPA proofs are larger per level (544B vs 480B) but the tree is shallower (256-ary vs 16-ary), so total proof size is comparable.
+### 7.2 Total Proof Size (Measured, 300K-entry tree)
 
-### 7.2 Batch Proof — Multipoint Aggregation (Measured)
+| Keys | Unique comms | Total proof size | Per-key overhead |
+|------|-------------|-----------------|-----------------|
+| 7 | 31 | 2,111 B | ~219 B/key |
+| 14 | 57 | 3,478 B | ~207 B/key |
+| 28 | 112 | 6,316 B | ~205 B/key |
+| 56 | 221 | 11,960 B | ~203 B/key |
+| 112 | 430 | 22,962 B | ~200 B/key |
+| 196 | 721 | 38,738 B | ~195 B/key |
 
-The Dankrad Feist multipoint scheme compresses ALL openings across ALL keys into a single proof:
+Per-key overhead decreases as batch size grows because more keys share internal node commitments. At scale, the commitment table dominates.
 
-| Keys | JVT Multiproof | JMT (N × individual) | Compression |
-|------|---------------|----------------------|-------------|
-| 1 | 576 B | 544 B | 1× |
-| 10 | 576 B | 5,440 B | 9× |
-| 100 | 576 B | 102,400 B | 178× |
-| 1,000 | 576 B | 1,504,000 B | 2,611× |
+### 7.3 Comparison with JMT (Merkle)
 
-**The multipoint proof is 576 bytes constant** (1 group element D + 1 IPA proof with 8 rounds = 32 + 544 bytes), regardless of how many keys are included. This is the core verkle advantage.
+| Keys | JVT total | JMT (N × individual) | Compression |
+|------|-----------|----------------------|-------------|
+| 7 | 2.1 KB | 27 KB | 13× |
+| 56 | 12 KB | 215 KB | 18× |
+| 196 | 39 KB | 753 KB | 19× |
 
-The multiproof protocol:
-1. Fiat-Shamir challenge `r` aggregates all openings via random linear combination
-2. Polynomials grouped by evaluation point, combined into quotient `g(X)`
-3. Challenge `t` (outside domain) produces `h(X) = Σ agg_f(X) / (t - z)`
-4. Single IPA proof for `h(X) - g(X)` at point `t`
-5. Verifier reconstructs `E` via MSM over commitments, checks single IPA
+JMT single-key proof: ~8 levels × 15 sibling hashes × 32B = ~3,840B per key (radix-16, 300K entries). JVT amortizes better because the 576B cryptographic proof is shared across all keys, and the commitment table deduplicates shared internal nodes.
 
-### 7.3 Notes
+### 7.4 What the 576B buys you
+
+The multipoint proof is 576 bytes constant — it cryptographically binds ALL opening triples regardless of count. The remaining proof size is **witness data**: the commitments and metadata the verifier needs to reconstruct those triples. This is analogous to Merkle proofs including sibling hashes — the hash function is "free" but the path data scales linearly.
+
+The compact wire format minimizes witness data by:
+- Deduplicating commitments (shared internal nodes stored once)
+- Deriving evaluation points from key bytes (not transmitted)
+- Deriving chain results via `commitment_to_field(next_commitment)` (not transmitted)
+- Storing commitment path indices as `u16` (2B) instead of full points (32B)
+
+### 7.5 Notes
 
 - All sizes measured from the implementation using real Bandersnatch curve operations
-- JMT proof sizes assume radix-16 with 15 sibling hashes per level
-- The 576B multiproof size does not include per-key metadata (stems, values) which the verifier also needs
+- JMT sizes assume radix-16 with 15 sibling hashes per level
+- Tree contained 300,000 entries with uniformly distributed BLAKE3 keys
 
 ---
 
@@ -719,12 +731,12 @@ pub trait TreeWriter {
 ### 11.4 Proof Generation
 
 ```rust
-// Single-key proof (individual IPA per tree level)
-pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<RealVerkleProof>;
+// Generate a proof for one or more keys (single and batch use the same function)
+pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Option<VerkleProof>;
 
-// Aggregated multiproof (single 576-byte proof for any number of keys)
-pub fn prove_aggregated<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Option<AggregatedMultiProof>;
+// Convenience: single-key proof
+pub fn prove_single<S: TreeReader>(store: &S, root_key: &NodeKey, key: &Key) -> Option<VerkleProof>;
 
-// Verification
-pub fn verify_aggregated(proof: &AggregatedMultiProof, root: Commitment, keys: &[Key], values: &[Option<Value>]) -> bool;
+// Verification (works for any number of keys)
+pub fn verify(proof: &VerkleProof, root: Commitment, keys: &[Key], values: &[Option<Value>]) -> bool;
 ```
