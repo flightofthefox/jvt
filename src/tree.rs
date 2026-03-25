@@ -243,11 +243,10 @@ fn batch_apply_internal<S: TreeReader>(
     version: u64,
     batch: &mut TreeUpdateBatch,
 ) -> BatchResult {
-    let mut new_internal = internal.clone();
     let path = &node_key.byte_path;
 
-    // Collect child updates/removals, then apply in batch to avoid
-    // per-child affine↔projective round-trips in commit_update.
+    // Collect child updates/removals first (reads only from `internal`),
+    // then clone and mutate only if something changed.
     let mut child_updates: Vec<(u8, u64, Commitment)> = Vec::new();
     let mut removals: Vec<u8> = Vec::new();
 
@@ -294,6 +293,9 @@ fn batch_apply_internal<S: TreeReader>(
     if child_updates.is_empty() && removals.is_empty() {
         return BatchResult::Unchanged;
     }
+
+    // Clone only when we know the node is changing.
+    let mut new_internal = internal.clone();
 
     // Apply removals first (they affect the children map for batch_update_children)
     for idx in &removals {
