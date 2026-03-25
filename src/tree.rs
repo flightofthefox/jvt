@@ -497,7 +497,9 @@ fn batch_create_subtree(
     }
 
     let parent_nk = NodeKey::new(version, node_path);
-    let mut children = HashMap::new();
+
+    // Partition inserts into per-child groups
+    let mut groups: Vec<(u8, &[(&Key, &Value)])> = Vec::new();
     let mut i = 0;
     while i < inserts.len() {
         let child_byte = inserts[i].0[depth];
@@ -505,13 +507,51 @@ fn batch_create_subtree(
         while j < inserts.len() && inserts[j].0[depth] == child_byte {
             j += 1;
         }
-        let group = &inserts[i..j];
+        groups.push((child_byte, &inserts[i..j]));
         i = j;
+    }
 
-        let child_nk = parent_nk.child(version, child_byte);
-        let child_result =
-            batch_create_subtree(group, depth + 1, child_nk.byte_path(), version, batch);
-        children.insert(child_byte, Child::new(version, child_result.commitment));
+    // Build child subtrees — each is independent, so parallelize when enabled.
+    #[cfg(feature = "parallel")]
+    let child_results: Vec<(u8, BatchNodeResult, TreeUpdateBatch)> = {
+        use rayon::prelude::*;
+        groups
+            .par_iter()
+            .map(|&(child_byte, group)| {
+                let child_nk = parent_nk.child(version, child_byte);
+                let mut child_batch = TreeUpdateBatch::default();
+                let result = batch_create_subtree(
+                    group,
+                    depth + 1,
+                    child_nk.byte_path(),
+                    version,
+                    &mut child_batch,
+                );
+                (child_byte, result, child_batch)
+            })
+            .collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let child_results: Vec<(u8, BatchNodeResult, TreeUpdateBatch)> = groups
+        .iter()
+        .map(|&(child_byte, group)| {
+            let child_nk = parent_nk.child(version, child_byte);
+            let mut child_batch = TreeUpdateBatch::default();
+            let result = batch_create_subtree(
+                group,
+                depth + 1,
+                child_nk.byte_path(),
+                version,
+                &mut child_batch,
+            );
+            (child_byte, result, child_batch)
+        })
+        .collect();
+
+    let mut children = HashMap::new();
+    for (child_byte, result, child_batch) in child_results {
+        children.insert(child_byte, Child::new(version, result.commitment));
+        batch.merge(child_batch);
     }
 
     let internal = InternalNode::new(children);

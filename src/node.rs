@@ -488,6 +488,13 @@ impl TreeUpdateBatch {
             node_key,
         });
     }
+
+    /// Merge another batch into this one.
+    pub fn merge(&mut self, other: TreeUpdateBatch) {
+        self.new_nodes.extend(other.new_nodes);
+        self.stale_nodes.extend(other.stale_nodes);
+        // root_key is only set at the top level, not in subtree batches
+    }
 }
 
 /// Find the common prefix length between two byte slices.
