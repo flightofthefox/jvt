@@ -326,9 +326,7 @@ fn batch_apply_internal<S: TreeReader>(
             .or_else(|| store.get_node(&remaining_key).map(|arc| (*arc).clone()));
 
         if let Some(Node::EaS(remaining_eas)) = remaining_node.as_ref() {
-            let mut new_stem = vec![remaining_idx];
-            new_stem.extend_from_slice(&remaining_eas.stem);
-            let collapsed = EaSNode::from_values(new_stem, remaining_eas.values.clone());
+            let collapsed = remaining_eas.with_prepended_stem(remaining_idx);
             let collapsed_key = NodeKey::new(version, path);
             let commitment = collapsed.commitment();
             batch.put_node(collapsed_key.clone(), Node::EaS(Box::new(collapsed)));

@@ -343,6 +343,31 @@ impl EaSNode {
         commit_update(c, stem_len + 2, field_zero(), c2_field)
     }
 
+    /// Create an EaS node with a new stem but the same values and
+    /// sub-commitments. Only recomputes the stem and extension commitments.
+    /// Used during collapse when an internal node merges into its sole EaS child.
+    pub fn with_prepended_stem(&self, prefix_byte: u8) -> Self {
+        let mut new_stem = Vec::with_capacity(1 + self.stem.len());
+        new_stem.push(prefix_byte);
+        new_stem.extend_from_slice(&self.stem);
+        let stem_c = Self::compute_stem_commitment(&new_stem);
+        let extension_commitment = Self::compute_extension_commitment_from_stem_cached(
+            stem_c,
+            new_stem.len(),
+            self.c1_field,
+            self.c2_field,
+        );
+        Self {
+            stem: new_stem,
+            values: self.values.clone(),
+            c1: self.c1,
+            c2: self.c2,
+            c1_field: self.c1_field,
+            c2_field: self.c2_field,
+            extension_commitment,
+        }
+    }
+
     /// Update a single value slot, recomputing commitments.
     pub fn update_value(&mut self, suffix: u8, new_value: Value) {
         self.batch_update_values(std::iter::once((suffix, Some(new_value))));
