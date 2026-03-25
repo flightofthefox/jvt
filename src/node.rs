@@ -197,34 +197,29 @@ impl InternalNode {
         let basis = get_basis();
         let mut acc: EdwardsProjective = self.commitment.0.into();
 
-        // Accumulate deltas in projective; store resolved children for
-        // post-loop insertion.
-        let mut pending: Vec<(u8, Child)> = Vec::new();
+        // Collect updates, then batch-convert commitment_to_field using
+        // Montgomery's trick (1 inversion instead of N).
+        let entries: Vec<(u8, u64, Commitment)> = updates.into_iter().collect();
+        let commitments: Vec<Commitment> = entries.iter().map(|e| e.2).collect();
+        let fields = batch_commitment_to_field(&commitments);
 
-        for (index, version, child_commitment) in updates {
+        for (i, &(index, _, _)) in entries.iter().enumerate() {
             let old_field = self
                 .children
                 .get(&index)
                 .map(|c| c.field)
                 .unwrap_or(field_zero());
 
-            // commitment_to_field is unavoidable per new child (need the
-            // field element for both the delta and the stored Child).
-            let new_field = commitment_to_field(child_commitment);
-            let delta = new_field.0 - old_field.0;
+            let delta = fields[i].0 - old_field.0;
             acc += basis[index as usize] * delta;
-
-            pending.push((
-                index,
-                Child::new_with_field(version, child_commitment, new_field),
-            ));
         }
 
         // Single affine conversion for the accumulated node commitment
         self.commitment = Commitment(acc.into_affine());
 
-        for (index, child) in pending {
-            self.children.insert(index, child);
+        for (i, (index, version, commitment)) in entries.into_iter().enumerate() {
+            self.children
+                .insert(index, Child::new_with_field(version, commitment, fields[i]));
         }
     }
 

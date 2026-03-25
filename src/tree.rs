@@ -671,9 +671,17 @@ fn batch_create_subtree(
         })
         .collect();
 
+    // Batch-convert child commitments to field elements (1 inversion instead of N)
+    let child_commitments: Vec<Commitment> =
+        child_results.iter().map(|(_, r, _)| r.commitment).collect();
+    let child_fields = batch_commitment_to_field(&child_commitments);
+
     let mut children = HashMap::new();
-    for (child_byte, result, child_batch) in child_results {
-        children.insert(child_byte, Child::new(version, result.commitment));
+    for (i, (child_byte, _result, child_batch)) in child_results.into_iter().enumerate() {
+        children.insert(
+            child_byte,
+            Child::new_with_field(version, child_commitments[i], child_fields[i]),
+        );
         batch.merge(child_batch);
     }
 

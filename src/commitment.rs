@@ -203,6 +203,35 @@ pub fn commitment_to_field(c: Commitment) -> FieldElement {
     FieldElement(Fr::from_le_bytes_mod_order(&bytes))
 }
 
+/// Batch-convert commitments to field elements using Montgomery's trick.
+/// One base field inversion + 3N multiplications instead of N inversions.
+pub fn batch_commitment_to_field(commitments: &[Commitment]) -> Vec<FieldElement> {
+    use ark_ed_on_bls12_381_bandersnatch::Fq;
+    use ark_serialize::CanonicalSerialize;
+
+    if commitments.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect y coordinates and batch-invert them
+    let mut y_coords: Vec<Fq> = commitments.iter().map(|c| c.0.y).collect();
+    ark_ff::batch_inversion(&mut y_coords);
+
+    // Compute x * y_inv for each, then serialize → Fr
+    commitments
+        .iter()
+        .zip(y_coords.iter())
+        .map(|(c, y_inv)| {
+            let x_div_y = c.0.x * y_inv;
+            let mut bytes = [0u8; 32];
+            x_div_y
+                .serialize_compressed(&mut bytes[..])
+                .expect("could not serialize base field element");
+            FieldElement(Fr::from_le_bytes_mod_order(&bytes))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
