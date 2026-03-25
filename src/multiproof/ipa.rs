@@ -51,8 +51,7 @@ pub fn create(
 ) -> IPAProof {
     transcript.domain_sep(b"ipa");
 
-    let mut g: Vec<EdwardsProjective> = crs.g.iter().map(|p| (*p).into()).collect();
-    let n = g.len();
+    let n = crs.g.len();
     assert_eq!(a_vec.len(), n);
     assert_eq!(b_vec.len(), n);
     assert!(n.is_power_of_two());
@@ -70,28 +69,54 @@ pub fn create(
     let mut l_vec = Vec::with_capacity(num_rounds);
     let mut r_vec = Vec::with_capacity(num_rounds);
 
-    for _ in 0..num_rounds {
+    // First round uses the original affine CRS generators directly (avoids
+    // affine→projective→affine round-trip through msm_proj). Subsequent
+    // rounds use folded projective generators.
+    let mut g_affine: Option<Vec<EdwardsAffine>> = Some(crs.g.clone());
+    let mut g_proj: Vec<EdwardsProjective> = Vec::new();
+
+    for _round in 0..num_rounds {
         let half = a_vec.len() / 2;
 
         let (a_l, a_r) = a_vec.split_at(half);
         let (b_l, b_r) = b_vec.split_at(half);
-        let (g_l, g_r) = g.split_at(half);
 
         let z_l = inner_product(a_r, b_l);
         let z_r = inner_product(a_l, b_r);
 
         // L = <a_R, G_L> + z_L * Q
         // R = <a_L, G_R> + z_R * Q
-        #[cfg(feature = "parallel")]
-        let (l, r): (EdwardsProjective, EdwardsProjective) = rayon::join(
-            || CRS::msm_proj(a_r, g_l) + q * z_l,
-            || CRS::msm_proj(a_l, g_r) + q * z_r,
-        );
-        #[cfg(not(feature = "parallel"))]
-        let (l, r): (EdwardsProjective, EdwardsProjective) = (
-            CRS::msm_proj(a_r, g_l) + q * z_l,
-            CRS::msm_proj(a_l, g_r) + q * z_r,
-        );
+        let (l, r): (EdwardsProjective, EdwardsProjective) = if let Some(ref ga) = g_affine {
+            let (ga_l, ga_r) = ga.split_at(half);
+            // First round: use affine CRS directly (no normalize_batch overhead)
+            #[cfg(feature = "parallel")]
+            {
+                rayon::join(
+                    || CRS::msm(a_r, ga_l) + q * z_l,
+                    || CRS::msm(a_l, ga_r) + q * z_r,
+                )
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                (CRS::msm(a_r, ga_l) + q * z_l, CRS::msm(a_l, ga_r) + q * z_r)
+            }
+        } else {
+            let (gp_l, gp_r) = g_proj.split_at(half);
+            #[cfg(feature = "parallel")]
+            {
+                rayon::join(
+                    || CRS::msm_proj(a_r, gp_l) + q * z_l,
+                    || CRS::msm_proj(a_l, gp_r) + q * z_r,
+                )
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                (
+                    CRS::msm_proj(a_r, gp_l) + q * z_l,
+                    CRS::msm_proj(a_l, gp_r) + q * z_r,
+                )
+            }
+        };
 
         // Batch normalize L and R together (1 field inversion instead of 2)
         let lr_affine = EdwardsProjective::normalize_batch(&[l, r]);
@@ -112,15 +137,28 @@ pub fn create(
         let mut new_b = Vec::with_capacity(half);
         let mut new_g = Vec::with_capacity(half);
 
-        for i in 0..half {
-            new_a.push(a_l[i] + x * a_r[i]);
-            new_b.push(b_l[i] + x_inv * b_r[i]);
-            new_g.push(g_l[i] + g_r[i] * x_inv);
+        if let Some(ref ga) = g_affine {
+            let (ga_l, ga_r) = ga.split_at(half);
+            for i in 0..half {
+                new_a.push(a_l[i] + x * a_r[i]);
+                new_b.push(b_l[i] + x_inv * b_r[i]);
+                let gl_proj: EdwardsProjective = ga_l[i].into();
+                let gr_proj: EdwardsProjective = ga_r[i].into();
+                new_g.push(gl_proj + gr_proj * x_inv);
+            }
+            g_affine = None;
+        } else {
+            let (gp_l, gp_r) = g_proj.split_at(half);
+            for i in 0..half {
+                new_a.push(a_l[i] + x * a_r[i]);
+                new_b.push(b_l[i] + x_inv * b_r[i]);
+                new_g.push(gp_l[i] + gp_r[i] * x_inv);
+            }
         }
 
         a_vec = new_a;
         b_vec = new_b;
-        g = new_g;
+        g_proj = new_g;
     }
 
     IPAProof {
