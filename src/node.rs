@@ -260,8 +260,9 @@ impl EaSNode {
     pub fn from_values(stem: Vec<u8>, values: HashMap<u8, Value>) -> Self {
         let c1 = Self::compute_c1(&values);
         let c2 = Self::compute_c2(&values);
-        let c1_field = commitment_to_field(c1);
-        let c2_field = commitment_to_field(c2);
+        let fields = batch_commitment_to_field(&[c1, c2]);
+        let c1_field = fields[0];
+        let c2_field = fields[1];
         let stem_c = Self::compute_stem_commitment(&stem);
         let extension_commitment = Self::compute_extension_commitment_from_stem_cached(
             stem_c,
@@ -408,26 +409,49 @@ impl EaSNode {
             };
         }
 
-        // Convert to affine once, then update extension commitment
-        if c1_changed {
-            self.c1 = Commitment(c1_proj.into_affine());
-            self.c1_field = commitment_to_field(self.c1);
-            self.extension_commitment = commit_update(
-                self.extension_commitment,
-                self.stem.len() + 1,
-                old_c1_field,
-                self.c1_field,
-            );
-        }
-        if c2_changed {
-            self.c2 = Commitment(c2_proj.into_affine());
-            self.c2_field = commitment_to_field(self.c2);
-            self.extension_commitment = commit_update(
-                self.extension_commitment,
-                self.stem.len() + 2,
-                old_c2_field,
-                self.c2_field,
-            );
+        // Convert to affine and batch commitment_to_field when both changed
+        match (c1_changed, c2_changed) {
+            (true, true) => {
+                let affine = EdwardsProjective::normalize_batch(&[c1_proj, c2_proj]);
+                self.c1 = Commitment(affine[0]);
+                self.c2 = Commitment(affine[1]);
+                let fields = batch_commitment_to_field(&[self.c1, self.c2]);
+                self.c1_field = fields[0];
+                self.c2_field = fields[1];
+                self.extension_commitment = commit_update(
+                    self.extension_commitment,
+                    self.stem.len() + 1,
+                    old_c1_field,
+                    self.c1_field,
+                );
+                self.extension_commitment = commit_update(
+                    self.extension_commitment,
+                    self.stem.len() + 2,
+                    old_c2_field,
+                    self.c2_field,
+                );
+            }
+            (true, false) => {
+                self.c1 = Commitment(c1_proj.into_affine());
+                self.c1_field = commitment_to_field(self.c1);
+                self.extension_commitment = commit_update(
+                    self.extension_commitment,
+                    self.stem.len() + 1,
+                    old_c1_field,
+                    self.c1_field,
+                );
+            }
+            (false, true) => {
+                self.c2 = Commitment(c2_proj.into_affine());
+                self.c2_field = commitment_to_field(self.c2);
+                self.extension_commitment = commit_update(
+                    self.extension_commitment,
+                    self.stem.len() + 2,
+                    old_c2_field,
+                    self.c2_field,
+                );
+            }
+            (false, false) => {}
         }
     }
 
