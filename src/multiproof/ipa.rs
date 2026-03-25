@@ -81,9 +81,17 @@ pub fn create(
         let z_r = inner_product(a_l, b_r);
 
         // L = <a_R, G_L> + z_L * Q
-        let l: EdwardsProjective = CRS::msm_proj(a_r, g_l) + q * z_l;
         // R = <a_L, G_R> + z_R * Q
-        let r: EdwardsProjective = CRS::msm_proj(a_l, g_r) + q * z_r;
+        #[cfg(feature = "parallel")]
+        let (l, r): (EdwardsProjective, EdwardsProjective) = rayon::join(
+            || CRS::msm_proj(a_r, g_l) + q * z_l,
+            || CRS::msm_proj(a_l, g_r) + q * z_r,
+        );
+        #[cfg(not(feature = "parallel"))]
+        let (l, r): (EdwardsProjective, EdwardsProjective) = (
+            CRS::msm_proj(a_r, g_l) + q * z_l,
+            CRS::msm_proj(a_l, g_r) + q * z_r,
+        );
 
         // Batch normalize L and R together (1 field inversion instead of 2)
         let lr_affine = EdwardsProjective::normalize_batch(&[l, r]);

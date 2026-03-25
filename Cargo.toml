@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Jellyfish Verkle Tree — hybrid JMT + verkle tree authenticated data structure"
 
+[features]
+parallel = ["rayon"]
+
 [dependencies]
 ark-ec = "0.5"
 ark-ed-on-bls12-381-bandersnatch = "0.5"
@@ -11,6 +14,7 @@ ark-ff = "0.5"
 ark-serialize = "0.5"
 ark-std = "0.5"
 blake3 = "1"
+rayon = { version = "1", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
