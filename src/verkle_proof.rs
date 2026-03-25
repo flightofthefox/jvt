@@ -10,6 +10,7 @@
 //! 6. Empty-slot non-inclusion: the opening result is zero
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_ff::AdditiveGroup;
@@ -29,15 +30,15 @@ static PRECOMP: std::sync::LazyLock<PrecomputedWeights> =
 // Vector reconstruction
 // ============================================================
 
-fn internal_node_vector(internal: &InternalNode) -> Vec<Fr> {
+fn internal_node_vector(internal: &InternalNode) -> Rc<Vec<Fr>> {
     let mut v = vec![Fr::ZERO; 256];
     for (&idx, child) in &internal.children {
         v[idx as usize] = child.field.0;
     }
-    v
+    Rc::new(v)
 }
 
-fn eas_extension_vector(eas: &EaSNode) -> Vec<Fr> {
+fn eas_extension_vector(eas: &EaSNode) -> Rc<Vec<Fr>> {
     let mut v = vec![Fr::ZERO; 256];
     v[0] = field_one().0;
     for (i, &byte) in eas.stem.iter().enumerate() {
@@ -45,10 +46,10 @@ fn eas_extension_vector(eas: &EaSNode) -> Vec<Fr> {
     }
     v[eas.stem.len() + 1] = eas.c1_field.0;
     v[eas.stem.len() + 2] = eas.c2_field.0;
-    v
+    Rc::new(v)
 }
 
-fn eas_sub_commitment_vector(eas: &EaSNode, is_c2: bool) -> Vec<Fr> {
+fn eas_sub_commitment_vector(eas: &EaSNode, is_c2: bool) -> Rc<Vec<Fr>> {
     let mut v = vec![Fr::ZERO; 256];
     for (&suffix, val) in &eas.values {
         if is_c2 && suffix >= 128 {
@@ -57,14 +58,18 @@ fn eas_sub_commitment_vector(eas: &EaSNode, is_c2: bool) -> Vec<Fr> {
             v[suffix as usize] = val.0;
         }
     }
-    v
+    Rc::new(v)
 }
 
 // ============================================================
 // Traversal
 // ============================================================
 
-type Opening = (EdwardsAffine, Vec<Fr>, usize, Fr);
+/// (commitment, polynomial, evaluation_point, result)
+/// Polynomial is Rc-shared to avoid cloning 8KB vectors when the same
+/// polynomial appears in multiple openings (e.g. extension vector opened
+/// at marker byte and at sub-commitment index).
+type Opening = (EdwardsAffine, Rc<Vec<Fr>>, usize, Fr);
 
 /// How the key lookup terminated.
 #[derive(Clone, Debug)]
@@ -292,7 +297,7 @@ pub fn prove<S: TreeReader>(store: &S, root_key: &NodeKey, keys: &[Key]) -> Opti
                 seen.insert(dedup_key, idx);
                 all_prover_queries.push(ProverQuery {
                     commitment: *comm,
-                    poly: LagrangeBasis::new(a.clone()),
+                    poly: LagrangeBasis::new(Rc::unwrap_or_clone(a.clone())),
                     point: *index,
                     result: *result,
                 });
