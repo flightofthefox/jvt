@@ -136,6 +136,53 @@ impl InternalNode {
         self.children.insert(index, new_child);
     }
 
+    /// Update multiple children, accumulating commitment deltas in projective
+    /// coordinates. Converts to affine once at the end, and computes
+    /// `commitment_to_field` per child only after the affine conversion.
+    ///
+    /// Each entry is `(index, version, child_commitment)`. Avoids per-child
+    /// affine↔projective round-trips and defers `commitment_to_field` calls.
+    pub fn batch_update_children(
+        &mut self,
+        updates: impl IntoIterator<Item = (u8, u64, Commitment)>,
+    ) {
+        use ark_ec::CurveGroup;
+        use ark_ed_on_bls12_381_bandersnatch::EdwardsProjective;
+
+        let basis = get_basis();
+        let mut acc: EdwardsProjective = self.commitment.0.into();
+
+        // Accumulate deltas in projective; store resolved children for
+        // post-loop insertion.
+        let mut pending: Vec<(u8, Child)> = Vec::new();
+
+        for (index, version, child_commitment) in updates {
+            let old_field = self
+                .children
+                .get(&index)
+                .map(|c| c.field)
+                .unwrap_or(field_zero());
+
+            // commitment_to_field is unavoidable per new child (need the
+            // field element for both the delta and the stored Child).
+            let new_field = commitment_to_field(child_commitment);
+            let delta = new_field.0 - old_field.0;
+            acc += basis[index as usize] * delta;
+
+            pending.push((
+                index,
+                Child::new_with_field(version, child_commitment, new_field),
+            ));
+        }
+
+        // Single affine conversion for the accumulated node commitment
+        self.commitment = Commitment(acc.into_affine());
+
+        for (index, child) in pending {
+            self.children.insert(index, child);
+        }
+    }
+
     pub fn child_count(&self) -> usize {
         self.children.len()
     }

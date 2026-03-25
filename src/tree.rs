@@ -245,7 +245,11 @@ fn batch_apply_internal<S: TreeReader>(
 ) -> BatchResult {
     let mut new_internal = internal.clone();
     let path = &node_key.byte_path;
-    let mut changed = false;
+
+    // Collect child updates/removals, then apply in batch to avoid
+    // per-child affine↔projective round-trips in commit_update.
+    let mut child_updates: Vec<(u8, u64, Commitment)> = Vec::new();
+    let mut removals: Vec<u8> = Vec::new();
 
     let mut i = 0;
     while i < updates.len() {
@@ -267,14 +271,10 @@ fn batch_apply_internal<S: TreeReader>(
             let child_key = NodeKey::new(child.version, child_path);
             match batch_apply_node(store, &child_key, group, depth + 1, version, batch) {
                 BatchResult::Changed(r) => {
-                    new_internal.update_child(child_byte, Child::new(version, r.commitment));
-                    changed = true;
+                    child_updates.push((child_byte, version, r.commitment));
                 }
                 BatchResult::Removed => {
-                    new_internal.children.remove(&child_byte);
-                    new_internal.commitment =
-                        InternalNode::compute_commitment(&new_internal.children);
-                    changed = true;
+                    removals.push(child_byte);
                 }
                 BatchResult::Unchanged => {}
             }
@@ -286,14 +286,27 @@ fn batch_apply_internal<S: TreeReader>(
                 .collect();
             if !inserts.is_empty() {
                 let r = batch_create_subtree(&inserts, depth + 1, &child_path, version, batch);
-                new_internal.update_child(child_byte, Child::new(version, r.commitment));
-                changed = true;
+                child_updates.push((child_byte, version, r.commitment));
             }
         }
     }
 
-    if !changed {
+    if child_updates.is_empty() && removals.is_empty() {
         return BatchResult::Unchanged;
+    }
+
+    // Apply removals first (they affect the children map for batch_update_children)
+    for idx in &removals {
+        new_internal.children.remove(idx);
+    }
+    if !removals.is_empty() {
+        // Recompute from scratch after removals (sparse children change)
+        new_internal.commitment = InternalNode::compute_commitment(&new_internal.children);
+    }
+
+    // Apply updates in batch — single projective accumulation
+    if !child_updates.is_empty() {
+        new_internal.batch_update_children(child_updates);
     }
 
     if new_internal.children.is_empty() {
