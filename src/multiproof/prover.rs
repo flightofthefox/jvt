@@ -116,28 +116,40 @@ impl MultiPointProver {
         // 4. Get challenge t (evaluation point outside domain)
         let t = transcript.challenge_scalar(b"t");
 
-        // 5. Compute h(X) = Σ_groups agg_f(X) / (t - z) (scalar division, t outside domain)
-        // First compute 1/(t - z) for each referenced z
-        let mut denominators: Vec<Fr> = Vec::new();
-        let mut denom_indices: Vec<usize> = Vec::new();
-        for (z, agg_f) in grouped_fs.iter().enumerate() {
-            if agg_f.is_some() {
-                denominators.push(t - Fr::from(z as u64));
-                denom_indices.push(z);
+        // 5. Compute h(X) and Lagrange coefficients.
+        // Lagrange coefficients only depend on (precomp, n, t) — compute in
+        // parallel with h(X) + E commitment when the feature is enabled.
+        let compute_h_and_e = || {
+            let mut denominators: Vec<Fr> = Vec::new();
+            let mut denom_indices: Vec<usize> = Vec::new();
+            for (z, agg_f) in grouped_fs.iter().enumerate() {
+                if agg_f.is_some() {
+                    denominators.push(t - Fr::from(z as u64));
+                    denom_indices.push(z);
+                }
             }
-        }
-        batch_inversion(&mut denominators);
+            batch_inversion(&mut denominators);
 
-        let mut h_x = vec![Fr::ZERO; n];
-        for (idx, &z) in denom_indices.iter().enumerate() {
-            let agg_f = grouped_fs[z].as_ref().unwrap();
-            let den_inv = denominators[idx];
-            for (j, val) in agg_f.iter().enumerate() {
-                h_x[j] += *val * den_inv;
+            let mut h_x = vec![Fr::ZERO; n];
+            for (idx, &z) in denom_indices.iter().enumerate() {
+                let agg_f = grouped_fs[z].as_ref().unwrap();
+                let den_inv = denominators[idx];
+                for (j, val) in agg_f.iter().enumerate() {
+                    h_x[j] += *val * den_inv;
+                }
             }
-        }
 
-        let e_comm = crs.commit_lagrange(&h_x);
+            let e_comm = crs.commit_lagrange(&h_x);
+            (h_x, e_comm)
+        };
+
+        let compute_lagrange = || LagrangeBasis::evaluate_lagrange_coefficients(precomp, n, t);
+
+        #[cfg(feature = "parallel")]
+        let ((h_x, e_comm), lagrange_coeffs) = rayon::join(compute_h_and_e, compute_lagrange);
+        #[cfg(not(feature = "parallel"))]
+        let ((h_x, e_comm), lagrange_coeffs) = (compute_h_and_e(), compute_lagrange());
+
         transcript.append_point(b"E", &e_comm);
 
         // 6. Compute h(X) - g(X) and create IPA proof at point t
@@ -146,14 +158,7 @@ impl MultiPointProver {
             - Into::<EdwardsProjective>::into(d_comm))
         .into_affine();
 
-        let ipa_proof = ipa::create(
-            transcript,
-            crs,
-            h_minus_g,
-            e_minus_d,
-            LagrangeBasis::evaluate_lagrange_coefficients(precomp, n, t),
-            t,
-        );
+        let ipa_proof = ipa::create(transcript, crs, h_minus_g, e_minus_d, lagrange_coeffs, t);
 
         MultiPointProof { ipa_proof, d_comm }
     }
