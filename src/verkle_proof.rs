@@ -112,8 +112,7 @@ fn traverse_for_key<S: TreeReader>(
 
                 match internal.children.get(&child_index) {
                     Some(child) => {
-                        let child_path: Vec<u8> = key[..depth + 1].to_vec();
-                        current_key = NodeKey::new(child.version, child_path);
+                        current_key = NodeKey::new(child.version, &key[..depth + 1]);
                         depth += 1;
                     }
                     None => {

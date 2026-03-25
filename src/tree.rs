@@ -146,8 +146,7 @@ fn get_recursive<S: TreeReader>(node: &Node, store: &S, key: &Key, depth: usize)
         Node::Internal(n) => {
             let child_index = key[depth];
             let child = n.children.get(&child_index)?;
-            let child_path: Vec<u8> = key[..depth + 1].to_vec();
-            let child_key = NodeKey::new(child.version, child_path);
+            let child_key = NodeKey::new(child.version, &key[..depth + 1]);
             let child_node = store.get_node(&child_key)?;
             get_recursive(&child_node, store, key, depth + 1)
         }
@@ -167,9 +166,7 @@ fn verify_node_commitment<S: TreeReader>(store: &S, node_key: &NodeKey) -> bool 
                 return false;
             }
             for (&idx, child) in &n.children {
-                let mut child_path = node_key.byte_path.clone();
-                child_path.push(idx);
-                let child_key = NodeKey::new(child.version, child_path);
+                let child_key = node_key.child(child.version, idx);
                 if !verify_node_commitment(store, &child_key) {
                     return false;
                 }
@@ -243,7 +240,7 @@ fn batch_apply_internal<S: TreeReader>(
     version: u64,
     batch: &mut TreeUpdateBatch,
 ) -> BatchResult {
-    let path = &node_key.byte_path;
+    let path = &node_key.byte_path();
 
     // Collect child updates/removals first (reads only from `internal`),
     // then clone and mutate only if something changed.
@@ -260,14 +257,8 @@ fn batch_apply_internal<S: TreeReader>(
         let group = &updates[i..j];
         i = j;
 
-        let child_path: Vec<u8> = path
-            .iter()
-            .chain(std::iter::once(&child_byte))
-            .copied()
-            .collect();
-
         if let Some(child) = internal.children.get(&child_byte) {
-            let child_key = NodeKey::new(child.version, child_path);
+            let child_key = node_key.child(child.version, child_byte);
             match batch_apply_node(store, &child_key, group, depth + 1, version, batch) {
                 BatchResult::Changed(r) => {
                     child_updates.push((child_byte, version, r.commitment));
@@ -284,7 +275,9 @@ fn batch_apply_internal<S: TreeReader>(
                 .filter_map(|&(k, v)| v.as_ref().map(|val| (k, val)))
                 .collect();
             if !inserts.is_empty() {
-                let r = batch_create_subtree(&inserts, depth + 1, &child_path, version, batch);
+                let child_nk = node_key.child(version, child_byte);
+                let r =
+                    batch_create_subtree(&inserts, depth + 1, child_nk.byte_path(), version, batch);
                 child_updates.push((child_byte, version, r.commitment));
             }
         }
@@ -319,12 +312,7 @@ fn batch_apply_internal<S: TreeReader>(
     // Collapse: single EaS child remaining → merge into one EaS with longer stem
     if new_internal.children.len() == 1 {
         let (&remaining_idx, remaining_child) = new_internal.children.iter().next().unwrap();
-        let remaining_path: Vec<u8> = path
-            .iter()
-            .chain(std::iter::once(&remaining_idx))
-            .copied()
-            .collect();
-        let remaining_key = NodeKey::new(remaining_child.version, remaining_path.clone());
+        let remaining_key = node_key.child(remaining_child.version, remaining_idx);
 
         // Check batch first (child may have been created/modified in this batch),
         // then fall back to store
@@ -341,7 +329,7 @@ fn batch_apply_internal<S: TreeReader>(
             let mut new_stem = vec![remaining_idx];
             new_stem.extend_from_slice(&remaining_eas.stem);
             let collapsed = EaSNode::from_values(new_stem, remaining_eas.values.clone());
-            let collapsed_key = NodeKey::new(version, path.clone());
+            let collapsed_key = NodeKey::new(version, path);
             let commitment = collapsed.commitment();
             batch.put_node(collapsed_key.clone(), Node::EaS(Box::new(collapsed)));
             batch.mark_stale(node_key.clone(), version);
@@ -353,7 +341,7 @@ fn batch_apply_internal<S: TreeReader>(
         }
     }
 
-    let new_key = NodeKey::new(version, path.clone());
+    let new_key = NodeKey::new(version, path);
     let commitment = new_internal.commitment;
     batch.put_node(new_key.clone(), Node::Internal(new_internal));
     batch.mark_stale(node_key.clone(), version);
@@ -373,7 +361,7 @@ fn batch_apply_eas(
     version: u64,
     batch: &mut TreeUpdateBatch,
 ) -> BatchResult {
-    let path = &node_key.byte_path;
+    let path = &node_key.byte_path();
 
     // Partition updates by whether they match the existing stem
     let mut same_stem_inserts: Vec<(u8, &Value)> = Vec::new();
@@ -417,7 +405,7 @@ fn batch_apply_eas(
             return BatchResult::Removed;
         }
 
-        let new_key = NodeKey::new(version, path.clone());
+        let new_key = NodeKey::new(version, path);
         let commitment = new_eas.commitment();
         batch.put_node(new_key.clone(), Node::EaS(Box::new(new_eas)));
         batch.mark_stale(node_key.clone(), version);
@@ -502,7 +490,7 @@ fn batch_create_subtree(
         }
         let eas = EaSNode::from_values(stem, values);
         let commitment = eas.commitment();
-        let node_key = NodeKey::new(version, node_path.to_vec());
+        let node_key = NodeKey::new(version, node_path);
         batch.put_node(node_key.clone(), Node::EaS(Box::new(eas)));
         return BatchNodeResult {
             node_key,
@@ -510,6 +498,7 @@ fn batch_create_subtree(
         };
     }
 
+    let parent_nk = NodeKey::new(version, node_path);
     let mut children = HashMap::new();
     let mut i = 0;
     while i < inserts.len() {
@@ -521,18 +510,15 @@ fn batch_create_subtree(
         let group = &inserts[i..j];
         i = j;
 
-        let child_path: Vec<u8> = node_path
-            .iter()
-            .chain(std::iter::once(&child_byte))
-            .copied()
-            .collect();
-        let child_result = batch_create_subtree(group, depth + 1, &child_path, version, batch);
+        let child_nk = parent_nk.child(version, child_byte);
+        let child_result =
+            batch_create_subtree(group, depth + 1, child_nk.byte_path(), version, batch);
         children.insert(child_byte, Child::new(version, child_result.commitment));
     }
 
     let internal = InternalNode::new(children);
     let commitment = internal.commitment;
-    let node_key = NodeKey::new(version, node_path.to_vec());
+    let node_key = parent_nk;
     batch.put_node(node_key.clone(), Node::Internal(internal));
 
     BatchNodeResult {

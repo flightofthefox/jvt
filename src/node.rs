@@ -33,33 +33,78 @@ pub fn key_stem(key: &Key) -> &[u8] {
     &key[..SUFFIX_INDEX]
 }
 
+/// Maximum byte-path length (depth never exceeds 31 with 32-byte keys).
+const MAX_PATH_LEN: usize = 31;
+
 /// Node key: uniquely identifies a node in versioned storage.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Uses inline storage (no heap allocation) since paths are at most 31 bytes.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct NodeKey {
     pub version: u64,
-    pub byte_path: Vec<u8>, // max length 31
+    path_buf: [u8; MAX_PATH_LEN],
+    path_len: u8,
+}
+
+impl std::fmt::Debug for NodeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeKey")
+            .field("version", &self.version)
+            .field("byte_path", &self.byte_path())
+            .finish()
+    }
 }
 
 impl NodeKey {
-    pub fn new(version: u64, byte_path: Vec<u8>) -> Self {
-        Self { version, byte_path }
+    pub fn new(version: u64, byte_path: &[u8]) -> Self {
+        debug_assert!(
+            byte_path.len() <= MAX_PATH_LEN,
+            "byte_path too long: {} > {}",
+            byte_path.len(),
+            MAX_PATH_LEN
+        );
+        let mut path_buf = [0u8; MAX_PATH_LEN];
+        path_buf[..byte_path.len()].copy_from_slice(byte_path);
+        Self {
+            version,
+            path_buf,
+            path_len: byte_path.len() as u8,
+        }
     }
 
     pub fn root(version: u64) -> Self {
-        Self::new(version, vec![])
+        Self::new(version, &[])
+    }
+
+    /// The byte path as a slice.
+    pub fn byte_path(&self) -> &[u8] {
+        &self.path_buf[..self.path_len as usize]
     }
 
     /// Encode for storage: [version_be_8B][path_len_1B][path_bytes]
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + 1 + self.byte_path.len());
+        let path = self.byte_path();
+        let mut buf = Vec::with_capacity(8 + 1 + path.len());
         buf.extend_from_slice(&self.version.to_be_bytes());
-        buf.push(self.byte_path.len() as u8);
-        buf.extend_from_slice(&self.byte_path);
+        buf.push(self.path_len);
+        buf.extend_from_slice(path);
         buf
     }
 
     pub fn depth(&self) -> usize {
-        self.byte_path.len()
+        self.path_len as usize
+    }
+
+    /// Create a child key by appending one byte to this key's path.
+    pub fn child(&self, version: u64, index: u8) -> Self {
+        let len = self.path_len as usize;
+        debug_assert!(len < MAX_PATH_LEN);
+        let mut path_buf = self.path_buf;
+        path_buf[len] = index;
+        Self {
+            version,
+            path_buf,
+            path_len: self.path_len + 1,
+        }
     }
 }
 
@@ -431,7 +476,7 @@ mod tests {
 
     #[test]
     fn node_key_encoding_roundtrip() {
-        let nk = NodeKey::new(42, vec![0xAB, 0xCD, 0xEF]);
+        let nk = NodeKey::new(42, &[0xAB, 0xCD, 0xEF]);
         let encoded = nk.encode();
         assert_eq!(encoded.len(), 8 + 1 + 3);
         assert_eq!(&encoded[..8], &42u64.to_be_bytes());
